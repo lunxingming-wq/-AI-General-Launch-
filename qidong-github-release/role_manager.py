@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-角色设定与提示词管理模块 (Role & Persona Manager)
-- 支持命令行交互式增/删/改/查 + 记事本安全编辑（兼容 Win11 多标签记事本）
-- 支持临时自定义角色（空行回车结束，支持一键转存永久）与原生默认（无角色）模式
-- 与 _active_template.jinja、server_core.py (/api/roles) 及 Web UI 人物卡浮窗实时联动
+Role & System Prompt Manager
+- Interactive CLI CRUD + safe Notepad editor (compatible with Windows 11 tabbed Notepad)
+- Temporary custom role (blank line to finish, optional save as permanent) & Native Default (no role)
+- Real-time sync with _active_template.jinja, server_core.py (/api/roles), and Web UI Role Switcher
 """
 import os
 import sys
@@ -12,37 +12,36 @@ import json
 import time
 import subprocess
 
-# ---------------------------------------------------------------------------
-# 动态获取控制台实际代码页，实现对应编码输出
-# 支持传统 cmd.exe (chcp 936/GBK) 和 Windows Terminal (chcp 65001/UTF-8)
-# ---------------------------------------------------------------------------
+
 def _detect_console_encoding() -> str:
     try:
         import ctypes
         cp = ctypes.windll.kernel32.GetConsoleOutputCP()
         if cp == 65001:
-            return 'utf-8'
-        if cp in (936, 54936):  # GBK / GB18030
-            return 'gbk'
+            return "utf-8"
+        if cp in (936, 54936):
+            return "gbk"
         if cp > 0:
-            return f'cp{cp}'
+            return f"cp{cp}"
     except Exception:
         pass
     try:
         import ctypes
         acp = ctypes.windll.kernel32.GetACP()
         if acp in (936, 54936):
-            return 'gbk'
+            return "gbk"
         if acp > 0:
-            return f'cp{acp}'
+            return f"cp{acp}"
     except Exception:
         pass
-    return 'gbk'
+    return "utf-8"
+
 
 _CONSOLE_ENC = _detect_console_encoding()
 
+
 def _bat_write(text: str) -> None:
-    """向 bat 控制台输出文本，自动匹配控制台代码页。"""
+    """Write text to Windows console matching active console codepage."""
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
@@ -53,7 +52,7 @@ def _bat_write(text: str) -> None:
     except Exception:
         pass
     try:
-        sys.stdout.buffer.write(text.encode(_CONSOLE_ENC, errors='replace'))
+        sys.stdout.buffer.write(text.encode(_CONSOLE_ENC, errors="replace"))
         sys.stdout.buffer.flush()
     except Exception:
         try:
@@ -61,6 +60,7 @@ def _bat_write(text: str) -> None:
             sys.stdout.flush()
         except Exception:
             pass
+
 
 TARGET_DIR = os.path.dirname(os.path.abspath(__file__))
 if TARGET_DIR not in sys.path:
@@ -78,17 +78,18 @@ MODE_TEMP = "temp"
 
 NONE_TOKEN = "__NONE__"
 TEMP_TOKEN = "__TEMP__"
-NONE_DISPLAY = "原生默认 (无角色)"
-TEMP_DISPLAY = "临时自定义角色"
+NONE_DISPLAY = "Native Default (No Role)"
+TEMP_DISPLAY = "Temporary Custom Role"
 
-# 仅匹配行首第 0 列的 [角色名] / 【角色名】 / === 角色名 ===，避免正文中缩进或行内方括号被误切分
+# Match role headers only at column 0 so indented/inline brackets inside prompts are never split
 HEADER_RE = re.compile(r'^(?:\[|【|===\s*)([^\[\]【】\r\n]{1,80})(?:\]|】|\s*===)\s*$')
 
 ROLE_FILE_HEADER = (
     "# ============================================================\n"
-    "# 角色设定配置文件 (role_setting.txt)\n"
-    "# 格式说明：每个角色以单独一行 [角色名] 开头，下方填写对应提示词（支持多行）。\n"
-    "# 注意：正文内部若需使用方括号，请在行首保留空格缩进以免被识别为新角色标题。\n"
+    "# Role Presets Configuration (role_setting.txt)\n"
+    "# Format: Start each role with [Role Name] on its own line, followed by\n"
+    "# its system prompt (multiline supported).\n"
+    "# Note: Indent leading brackets inside prompt text with spaces.\n"
     "# ============================================================\n\n"
 )
 
@@ -113,7 +114,6 @@ def parse_roles(content: str):
     current_lines = []
 
     for line in lines:
-        # 跳过第一个角色之前的注释行与空行
         if current_name is None:
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -144,7 +144,7 @@ def list_roles():
 
 
 def _sanitize_prompt_for_txt(prompt: str) -> str:
-    """防止提示词正文某一行恰好撞上行首 [xxx] 正则而被拆分成新角色"""
+    """Prevent lines inside a prompt starting with [xxx] from being parsed as new headers."""
     safe_lines = []
     for line in (prompt or "").splitlines():
         if HEADER_RE.match(line):
@@ -155,10 +155,10 @@ def _sanitize_prompt_for_txt(prompt: str) -> str:
 
 
 def save_roles_to_file(roles_list):
-    """将角色列表安全写入 role_setting.txt"""
+    """Write role list safely to role_setting.txt."""
     blocks = []
     for name, prompt in roles_list:
-        clean_name = name.replace("[", "（").replace("]", "）").replace("\n", " ").strip()
+        clean_name = name.replace("[", "(").replace("]", ")").replace("\n", " ").strip()
         clean_prompt = _sanitize_prompt_for_txt(prompt)
         blocks.append(f"[{clean_name}]\n{clean_prompt}\n")
     content = ROLE_FILE_HEADER + "\n".join(blocks)
@@ -167,7 +167,7 @@ def save_roles_to_file(roles_list):
 
 
 def get_state() -> dict:
-    """读取当前激活角色状态（兼容旧版 _active_role_name.txt）"""
+    """Read active role state (backward-compatible with legacy _active_role_name.txt)."""
     state = None
     if os.path.exists(ACTIVE_STATE_PATH):
         try:
@@ -188,7 +188,6 @@ def get_state() -> dict:
             mode = MODE_PRESET if (roles and default_name != NONE_TOKEN) else MODE_NONE
             state = {"mode": mode, "active_role": default_name, "temp_prompt": "", "launch_id": str(time.time())}
 
-    # 校验 preset 角色是否仍存在
     if state.get("mode") == MODE_PRESET:
         if not roles:
             state["mode"] = MODE_NONE
@@ -223,7 +222,7 @@ def save_state(state: dict) -> None:
 
 
 def get_active_prompt_info():
-    """返回 (mode, display_name, prompt)"""
+    """Return (mode, display_name, prompt)."""
     state = get_state()
     mode = state.get("mode", MODE_PRESET)
     if mode == MODE_NONE:
@@ -242,13 +241,12 @@ def get_active_prompt_info():
 
 
 def get_current_active_info():
-    """兼容旧接口：返回 (active_name, active_prompt)"""
+    """Legacy helper: return (active_name, active_prompt)."""
     _, name, prompt = get_active_prompt_info()
     return name, prompt
 
 
 def get_roles_payload() -> dict:
-    """生成前后端统一的角色状态数据结构"""
     roles = list_roles()
     state = get_state()
     mode, display_name, _ = get_active_prompt_info()
@@ -258,12 +256,12 @@ def get_roles_payload() -> dict:
         "active_display": display_name,
         "temp_prompt": state.get("temp_prompt", "") if mode == MODE_TEMP else "",
         "launch_id": str(state.get("launch_id", "")),
-        "roles": [{"id": idx, "name": name, "prompt": prompt} for idx, (name, prompt) in enumerate(roles, 1)]
+        "roles": [{"id": idx, "name": name, "prompt": prompt} for idx, (name, prompt) in enumerate(roles, 1)],
     }
 
 
 def update_jinja_identity(role_name: str, prompt: str) -> None:
-    """使用 json.dumps 安全写入 _active_template.jinja，完整保留多行换行与英文双引号"""
+    """Safely serialize active role into _active_template.jinja via json.dumps."""
     try:
         if not os.path.exists(ACTIVE_TEMPLATE_PATH):
             return
@@ -276,12 +274,12 @@ def update_jinja_identity(role_name: str, prompt: str) -> None:
         new_lines = []
         for line in lines:
             stripped = line.lstrip()
-            if stripped.startswith('{%- set persona_name'):
-                new_lines.append(f'{{%- set persona_name = {encoded_name} %}}\n')
-            elif stripped.startswith('{%- set system_identity'):
-                new_lines.append(f'{{%- set system_identity = {encoded_prompt} %}}\n')
-            elif stripped.startswith('{%- set qwythos_identity'):
-                new_lines.append(f'{{%- set qwythos_identity = {encoded_prompt} %}}\n')
+            if stripped.startswith("{%- set persona_name"):
+                new_lines.append(f"{{%- set persona_name = {encoded_name} %}}\n")
+            elif stripped.startswith("{%- set system_identity"):
+                new_lines.append(f"{{%- set system_identity = {encoded_prompt} %}}\n")
+            elif stripped.startswith("{%- set qwythos_identity"):
+                new_lines.append(f"{{%- set qwythos_identity = {encoded_prompt} %}}\n")
             else:
                 new_lines.append(line)
 
@@ -303,7 +301,7 @@ def export_roles_json():
 
 
 def update_web_index():
-    """向 web/index.html 注入支持实时同步与在线增删改查的人物卡浮窗"""
+    """Inject live-syncing Role Switcher & CRUD Manager floating UI into web/index.html."""
     try:
         if not os.path.exists(WEB_INDEX_PATH):
             return
@@ -348,9 +346,7 @@ def update_web_index():
     border-color: rgba(129, 140, 248, 0.55);
     transform: translateY(-1px);
   }}
-  #role-switcher-btn:active {{
-    transform: scale(0.96);
-  }}
+  #role-switcher-btn:active {{ transform: scale(0.96); }}
   #role-modal-overlay {{
     position: fixed;
     inset: 0;
@@ -363,9 +359,7 @@ def update_web_index():
     justify-content: center;
     padding: 16px;
   }}
-  #role-modal-overlay.active {{
-    display: flex;
-  }}
+  #role-modal-overlay.active {{ display: flex; }}
   #role-modal {{
     width: 100%;
     max-width: 540px;
@@ -401,11 +395,7 @@ def update_web_index():
     align-items: center;
     gap: 6px;
   }}
-  .role-header-actions {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }}
+  .role-header-actions {{ display: flex; align-items: center; gap: 8px; }}
   .role-btn-primary {{
     background: #6366f1;
     color: #fff;
@@ -439,14 +429,8 @@ def update_web_index():
     border-radius: 6px;
     line-height: 1;
   }}
-  .role-modal-close:hover {{
-    color: #fff;
-    background: rgba(255, 255, 255, 0.1);
-  }}
-  .role-search-wrap {{
-    padding: 10px 14px 0 14px;
-    display: none;
-  }}
+  .role-modal-close:hover {{ color: #fff; background: rgba(255, 255, 255, 0.1); }}
+  .role-search-wrap {{ padding: 10px 14px 0 14px; display: none; }}
   .role-search-wrap.visible {{ display: block; }}
   .role-search-input {{
     width: 100%;
@@ -487,18 +471,8 @@ def update_web_index():
     background: rgba(99, 102, 241, 0.18);
     border-color: rgba(99, 102, 241, 0.6);
   }}
-  .role-item-top {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-  }}
-  .role-item-title-wrap {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-  }}
+  .role-item-top {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
+  .role-item-title-wrap {{ display: flex; align-items: center; gap: 8px; min-width: 0; }}
   .role-name {{
     font-weight: 600;
     font-size: 14px;
@@ -518,12 +492,7 @@ def update_web_index():
     flex-shrink: 0;
   }}
   .role-item.active .role-badge {{ display: inline-block; }}
-  .role-item-ops {{
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }}
+  .role-item-ops {{ display: flex; align-items: center; gap: 4px; flex-shrink: 0; }}
   .role-op-btn {{
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.1);
@@ -548,11 +517,7 @@ def update_web_index():
     white-space: pre-wrap;
     word-break: break-word;
   }}
-  .role-prompt-preview.expanded {{
-    display: block;
-    -webkit-line-clamp: unset;
-    color: #cbd5e1;
-  }}
+  .role-prompt-preview.expanded {{ display: block; -webkit-line-clamp: unset; color: #cbd5e1; }}
   .role-expand-link {{
     align-self: flex-start;
     background: none;
@@ -592,19 +557,9 @@ def update_web_index():
     outline: none;
     line-height: 1.55;
   }}
-  .role-field textarea {{
-    resize: vertical;
-    min-height: 160px;
-  }}
-  .role-field input:focus, .role-field textarea:focus {{
-    border-color: #6366f1;
-  }}
-  .role-editor-actions {{
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-    margin-top: 4px;
-  }}
+  .role-field textarea {{ resize: vertical; min-height: 160px; }}
+  .role-field input:focus, .role-field textarea:focus {{ border-color: #6366f1; }}
+  .role-editor-actions {{ display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }}
   .role-modal-footer {{
     padding: 10px 16px;
     border-top: 1px solid rgba(255, 255, 255, 0.08);
@@ -629,10 +584,7 @@ def update_web_index():
     transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     z-index: 10001;
   }}
-  #role-toast.show {{
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }}
+  #role-toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
   details summary, .think-header, .reasoning-header, summary {{
     cursor: pointer !important;
     touch-action: manipulation !important;
@@ -640,54 +592,49 @@ def update_web_index():
     user-select: none !important;
   }}
   @media (max-width: 640px) {{
-    #role-switcher-btn {{
-      top: 8px;
-      right: 48px;
-      padding: 5px 10px;
-      font-size: 12px;
-    }}
+    #role-switcher-btn {{ top: 8px; right: 48px; padding: 5px 10px; font-size: 12px; }}
   }}
 </style>
 
-<div id="role-switcher-btn" title="点击管理或切换人物卡设定">
+<div id="role-switcher-btn" title="Click to switch or edit system roles">
   <span id="role-btn-icon">🎭</span>
-  <span id="role-btn-name">人物卡</span>
+  <span id="role-btn-name">Roles</span>
 </div>
 
 <div id="role-modal-overlay">
   <div id="role-modal">
     <div class="role-modal-header">
-      <h3 id="role-modal-title"><span>🎭</span> 人物卡管理与热切换</h3>
+      <h3 id="role-modal-title"><span>🎭</span> Role Manager &amp; Hot-Switcher</h3>
       <div class="role-header-actions">
-        <button class="role-btn-primary" id="role-add-btn" type="button">+ 新建角色</button>
-        <button class="role-btn-secondary" id="role-back-btn" type="button" style="display:none;">← 返回列表</button>
+        <button class="role-btn-primary" id="role-add-btn" type="button">+ New Role</button>
+        <button class="role-btn-secondary" id="role-back-btn" type="button" style="display:none;">&larr; Back</button>
         <button class="role-modal-close" id="role-modal-close-btn" type="button">&times;</button>
       </div>
     </div>
 
     <div class="role-search-wrap" id="role-search-wrap">
-      <input class="role-search-input" id="role-search-input" type="text" placeholder="搜索角色名称或提示词关键词..." />
+      <input class="role-search-input" id="role-search-input" type="text" placeholder="Search role name or prompt keywords..." />
     </div>
 
     <div class="role-list" id="role-list-container"></div>
 
     <div class="role-editor-panel" id="role-editor-panel">
       <div class="role-field">
-        <label for="role-edit-name"><span>角色名称</span></label>
-        <input id="role-edit-name" type="text" maxlength="60" placeholder="例如：编程专家 / 创意写作助手" />
+        <label for="role-edit-name"><span>Role Name</span></label>
+        <input id="role-edit-name" type="text" maxlength="60" placeholder="e.g. Coding Expert / Writing Assistant" />
       </div>
       <div class="role-field">
-        <label for="role-edit-prompt"><span>系统提示词 (System Prompt，支持多行)</span><span id="role-char-count">0 字</span></label>
-        <textarea id="role-edit-prompt" placeholder="输入该角色的身份、风格与回复规范..."></textarea>
+        <label for="role-edit-prompt"><span>System Prompt (multiline supported)</span><span id="role-char-count">0 chars</span></label>
+        <textarea id="role-edit-prompt" placeholder="Enter role identity, style, and response guidelines..."></textarea>
       </div>
       <div class="role-editor-actions">
-        <button class="role-btn-secondary" id="role-edit-cancel-btn" type="button">取消</button>
-        <button class="role-btn-primary" id="role-edit-save-btn" type="button">保存并立即生效</button>
+        <button class="role-btn-secondary" id="role-edit-cancel-btn" type="button">Cancel</button>
+        <button class="role-btn-primary" id="role-edit-save-btn" type="button">Save &amp; Apply Now</button>
       </div>
     </div>
 
     <div class="role-modal-footer" id="role-modal-footer">
-      切换或编辑保存后，将在下一条消息立即生效（不影响已有历史对话）。
+      Changes take effect immediately on the next message without restarting the model.
     </div>
   </div>
 </div>
@@ -708,7 +655,7 @@ def update_web_index():
     roles: EMBEDDED_DATA.roles || []
   }};
   let apiAvailable = false;
-  let editingRoleId = null; // null = creating new, number = editing existing, "TEMP_SAVE" = saving temp role
+  let editingRoleId = null;
   let pendingDeleteId = null;
   let searchKeyword = "";
 
@@ -746,10 +693,10 @@ def update_web_index():
   }}
 
   function getActiveDisplayName() {{
-    if (state.mode === "none") return "原生默认";
-    if (state.mode === "temp") return "临时角色";
+    if (state.mode === "none") return "Native Default";
+    if (state.mode === "temp") return "Temp Role";
     const found = state.roles.find(r => r.name === state.active_role) || state.roles[0];
-    return found ? found.name : "原生默认";
+    return found ? found.name : "Native Default";
   }}
 
   function syncWindowAndButton() {{
@@ -760,14 +707,14 @@ def update_web_index():
 
     if (state.mode === "none") {{
       btnIcon.textContent = "⚪";
-      btnName.textContent = "原生默认";
+      btnName.textContent = "Native";
     }} else if (state.mode === "temp") {{
       btnIcon.textContent = "⚡";
-      btnName.textContent = "临时角色";
+      btnName.textContent = "Temp Role";
     }} else {{
       btnIcon.textContent = "🎭";
       let shortName = disp.split(" ")[0].replace(/[\\(（].*[\\)）]/, "").trim() || disp;
-      if (shortName.length > 6) shortName = shortName.slice(0, 5) + "..";
+      if (shortName.length > 10) shortName = shortName.slice(0, 9) + "..";
       btnName.textContent = shortName;
     }}
     try {{
@@ -797,7 +744,7 @@ def update_web_index():
     syncWindowAndButton();
     syncActiveToServer({{ mode: "none" }});
     renderRolesList();
-    if (notify) showToast("已切换至「原生默认模式」（不注入角色设定）");
+    if (notify) showToast("Switched to Native Default (no system role injected)");
   }}
 
   function selectTemp(notify = true) {{
@@ -806,7 +753,7 @@ def update_web_index():
     syncWindowAndButton();
     syncActiveToServer({{ mode: "temp", temp_prompt: state.temp_prompt }});
     renderRolesList();
-    if (notify) showToast("已切换至「临时自定义角色」");
+    if (notify) showToast("Switched to Temporary Custom Role");
   }}
 
   function selectPreset(role, notify = true) {{
@@ -815,13 +762,13 @@ def update_web_index():
     syncWindowAndButton();
     syncActiveToServer({{ mode: "preset", role_name: role.name }});
     renderRolesList();
-    if (notify) showToast("已切换至人物卡：「" + role.name + "」");
+    if (notify) showToast("Switched role to: " + role.name);
   }}
 
   function openListView() {{
     editingRoleId = null;
     pendingDeleteId = null;
-    modalTitle.innerHTML = '<span>🎭</span> 人物卡管理与热切换';
+    modalTitle.innerHTML = '<span>🎭</span> Role Manager &amp; Hot-Switcher';
     listContainer.style.display = "flex";
     editorPanel.classList.remove("active");
     addBtn.style.display = "inline-block";
@@ -832,26 +779,26 @@ def update_web_index():
 
   function openEditorView(roleOrNull, isTempSave = false) {{
     if (!apiAvailable) {{
-      showToast("当前为原生回退模式，请确保 server_core.py 运行以在线保存角色");
+      showToast("Running in fallback mode; start server_core.py to edit roles online");
       return;
     }}
     if (isTempSave) {{
       editingRoleId = "TEMP_SAVE";
-      modalTitle.innerHTML = '<span>💾</span> 保存临时角色为永久预设';
+      modalTitle.innerHTML = '<span>💾</span> Save Temp Role as Preset';
       editNameInput.value = "";
       editPromptInput.value = state.temp_prompt || "";
     }} else if (roleOrNull) {{
       editingRoleId = roleOrNull.id;
-      modalTitle.innerHTML = '<span>✏️</span> 编辑角色设定';
+      modalTitle.innerHTML = '<span>✏️</span> Edit Role';
       editNameInput.value = roleOrNull.name;
       editPromptInput.value = roleOrNull.prompt;
     }} else {{
       editingRoleId = null;
-      modalTitle.innerHTML = '<span>➕</span> 新建角色设定';
+      modalTitle.innerHTML = '<span>➕</span> New Role';
       editNameInput.value = "";
       editPromptInput.value = "";
     }}
-    charCountSpan.textContent = editPromptInput.value.length + " 字";
+    charCountSpan.textContent = editPromptInput.value.length + " chars";
     listContainer.style.display = "none";
     searchWrap.classList.remove("visible");
     editorPanel.classList.add("active");
@@ -863,19 +810,11 @@ def update_web_index():
   async function saveEditorForm() {{
     const name = editNameInput.value.trim();
     const prompt = editPromptInput.value.trim();
-    if (!name) {{
-      showToast("请填写角色名称");
-      editNameInput.focus();
-      return;
-    }}
-    if (!prompt) {{
-      showToast("请填写系统提示词内容");
-      editPromptInput.focus();
-      return;
-    }}
+    if (!name) {{ showToast("Please enter a role name"); editNameInput.focus(); return; }}
+    if (!prompt) {{ showToast("Please enter a system prompt"); editPromptInput.focus(); return; }}
 
     editSaveBtn.disabled = true;
-    editSaveBtn.textContent = "保存中...";
+    editSaveBtn.textContent = "Saving...";
     try {{
       let res;
       if (editingRoleId === null || editingRoleId === "TEMP_SAVE") {{
@@ -893,38 +832,38 @@ def update_web_index():
       }}
       const data = await res.json();
       if (!res.ok || data.status !== "ok") {{
-        showToast(data.detail || data.message || "保存失败");
+        showToast(data.detail || data.message || "Failed to save");
       }} else {{
         applyServerData(data, true);
         openListView();
-        showToast("已保存并激活角色：「" + name + "」");
+        showToast("Saved and activated role: " + name);
       }}
     }} catch (e) {{
-      showToast("保存请求失败：" + e.message);
+      showToast("Save request failed: " + e.message);
     }} finally {{
       editSaveBtn.disabled = false;
-      editSaveBtn.textContent = "保存并立即生效";
+      editSaveBtn.textContent = "Save & Apply Now";
     }}
   }}
 
   async function deleteRoleById(roleId, roleName) {{
     if (!apiAvailable) {{
-      showToast("需要 server_core.py 运行才能在线删除");
+      showToast("Start server_core.py to delete roles online");
       return;
     }}
     try {{
       const res = await fetch("/api/roles/" + roleId, {{ method: "DELETE" }});
       const data = await res.json();
       if (!res.ok || data.status !== "ok") {{
-        showToast(data.detail || "删除失败");
+        showToast(data.detail || "Delete failed");
       }} else {{
         pendingDeleteId = null;
         applyServerData(data, true);
         renderRolesList();
-        showToast("已删除角色：「" + roleName + "」");
+        showToast("Deleted role: " + roleName);
       }}
     }} catch (e) {{
-      showToast("删除失败：" + e.message);
+      showToast("Delete failed: " + e.message);
     }}
   }}
 
@@ -932,18 +871,17 @@ def update_web_index():
     listContainer.innerHTML = "";
     const kw = searchKeyword.trim().toLowerCase();
 
-    // 1. 内置「原生默认模式（无角色）」卡片
-    if (!kw || "原生默认无角色native".includes(kw)) {{
+    if (!kw || "native default no role".includes(kw)) {{
       const noneCard = document.createElement("div");
       noneCard.className = "role-item" + (state.mode === "none" ? " active" : "");
       noneCard.innerHTML = `
         <div class="role-item-top">
           <div class="role-item-title-wrap">
-            <span class="role-name">⚪ 原生默认模式（不注入角色设定）</span>
-            <span class="role-badge">生效中</span>
+            <span class="role-name">⚪ Native Default (No Role Injected)</span>
+            <span class="role-badge">Active</span>
           </div>
         </div>
-        <div class="role-prompt-preview">使用模型自身原始能力直接对话，适合写代码、翻译、英文交流或纯粹模型测试。</div>
+        <div class="role-prompt-preview">Use the model with zero custom role framing (ideal for coding, translation, or raw testing).</div>
       `;
       noneCard.addEventListener("click", () => {{
         selectNone(true);
@@ -952,8 +890,7 @@ def update_web_index():
       listContainer.appendChild(noneCard);
     }}
 
-    // 2. 若启动器设置了临时自定义角色，展示临时卡片
-    if (state.temp_prompt && (!kw || "临时自定义角色".includes(kw) || state.temp_prompt.toLowerCase().includes(kw))) {{
+    if (state.temp_prompt && (!kw || "temporary custom role".includes(kw) || state.temp_prompt.toLowerCase().includes(kw))) {{
       const tempCard = document.createElement("div");
       tempCard.className = "role-item" + (state.mode === "temp" ? " active" : "");
 
@@ -961,8 +898,8 @@ def update_web_index():
       top.className = "role-item-top";
       top.innerHTML = `
         <div class="role-item-title-wrap">
-          <span class="role-name">⚡ 临时自定义角色（本次启动）</span>
-          <span class="role-badge">生效中</span>
+          <span class="role-name">⚡ Temporary Custom Role (This Session)</span>
+          <span class="role-badge">Active</span>
         </div>
       `;
       if (apiAvailable) {{
@@ -970,7 +907,7 @@ def update_web_index():
         ops.className = "role-item-ops";
         const saveBtn = document.createElement("button");
         saveBtn.className = "role-op-btn";
-        saveBtn.textContent = "💾 存为永久";
+        saveBtn.textContent = "💾 Save Preset";
         saveBtn.addEventListener("click", (e) => {{
           e.stopPropagation();
           openEditorView(null, true);
@@ -991,7 +928,6 @@ def update_web_index():
       listContainer.appendChild(tempCard);
     }}
 
-    // 3. 永久角色卡片列表
     const filtered = state.roles.filter(r => !kw || r.name.toLowerCase().includes(kw) || r.prompt.toLowerCase().includes(kw));
     filtered.forEach(r => {{
       const isActive = (state.mode === "preset" && state.active_role === r.name);
@@ -1008,7 +944,7 @@ def update_web_index():
       nameSpan.textContent = r.name;
       const badge = document.createElement("span");
       badge.className = "role-badge";
-      badge.textContent = "生效中";
+      badge.textContent = "Active";
       titleWrap.appendChild(nameSpan);
       titleWrap.appendChild(badge);
       top.appendChild(titleWrap);
@@ -1019,7 +955,7 @@ def update_web_index():
 
         const editBtn = document.createElement("button");
         editBtn.className = "role-op-btn";
-        editBtn.textContent = "✏️ 编辑";
+        editBtn.textContent = "✏️ Edit";
         editBtn.addEventListener("click", (e) => {{
           e.stopPropagation();
           openEditorView(r, false);
@@ -1028,7 +964,7 @@ def update_web_index():
         const delBtn = document.createElement("button");
         if (pendingDeleteId === r.id) {{
           delBtn.className = "role-op-btn confirm-del";
-          delBtn.textContent = "确认删除?";
+          delBtn.textContent = "Confirm?";
           delBtn.addEventListener("click", (e) => {{
             e.stopPropagation();
             deleteRoleById(r.id, r.name);
@@ -1036,7 +972,7 @@ def update_web_index():
         }} else {{
           delBtn.className = "role-op-btn danger";
           delBtn.textContent = "🗑️";
-          delBtn.title = "删除角色";
+          delBtn.title = "Delete role";
           delBtn.addEventListener("click", (e) => {{
             e.stopPropagation();
             pendingDeleteId = r.id;
@@ -1058,11 +994,11 @@ def update_web_index():
       if (r.prompt.length > 70 || r.prompt.includes("\\n")) {{
         const expandBtn = document.createElement("button");
         expandBtn.className = "role-expand-link";
-        expandBtn.textContent = "展开全文";
+        expandBtn.textContent = "Show more";
         expandBtn.addEventListener("click", (e) => {{
           e.stopPropagation();
           const exp = preview.classList.toggle("expanded");
-          expandBtn.textContent = exp ? "收起" : "展开全文";
+          expandBtn.textContent = exp ? "Collapse" : "Show more";
         }});
         item.appendChild(expandBtn);
       }}
@@ -1077,7 +1013,7 @@ def update_web_index():
     if (!filtered.length && kw) {{
       const empty = document.createElement("div");
       empty.style.cssText = "text-align:center;padding:24px;color:#94a3b8;font-size:13px;";
-      empty.textContent = "没有找到匹配的角色设定";
+      empty.textContent = "No matching roles found";
       listContainer.appendChild(empty);
     }}
   }}
@@ -1087,14 +1023,12 @@ def update_web_index():
     const serverLaunchId = String(data.launch_id || "");
     const savedLaunchId = localStorage.getItem(STORAGE_KEY_LAUNCH) || "";
 
-    // 若本次是 qidong.bat 新启动（launch_id 变化）或刚在前端保存修改，始终以服务端为准，防止旧缓存覆盖新选角！
     if (forceTrustServer || !savedLaunchId || (serverLaunchId && serverLaunchId !== savedLaunchId)) {{
       state.mode = data.mode || "preset";
       state.active_role = data.active_role || (state.roles[0] ? state.roles[0].name : "__NONE__");
       state.temp_prompt = data.temp_prompt || "";
       state.launch_id = serverLaunchId;
     }} else {{
-      // 同一次启动内刷新页面：优先使用当前服务端状态，若本地有切换则兼容恢复
       state.mode = data.mode || state.mode;
       state.active_role = data.active_role || state.active_role;
       state.temp_prompt = data.temp_prompt || "";
@@ -1131,7 +1065,7 @@ def update_web_index():
   editCancelBtn.addEventListener("click", openListView);
   editSaveBtn.addEventListener("click", saveEditorForm);
   editPromptInput.addEventListener("input", () => {{
-    charCountSpan.textContent = editPromptInput.value.length + " 字";
+    charCountSpan.textContent = editPromptInput.value.length + " chars";
   }});
   searchInput.addEventListener("input", () => {{
     searchKeyword = searchInput.value;
@@ -1141,7 +1075,6 @@ def update_web_index():
     if (e.target === overlay) overlay.classList.remove("active");
   }});
 
-  // Global Fetch Interceptor: 动态注入当前选定角色（或显式通知后端跳过默认角色）
   const origFetch = window.fetch;
   window.fetch = async function(...args) {{
     try {{
@@ -1156,7 +1089,6 @@ def update_web_index():
               const mode = window.__active_role_mode || "preset";
               const prompt = window.__active_role_prompt || "";
 
-              // 添加角色模式头，便于 server_core.py 针对非 Qwen 模型精准处理
               if (opts.headers instanceof Headers) {{
                 opts.headers.set("X-Llama-Role-Mode", mode);
               }} else {{
@@ -1164,7 +1096,6 @@ def update_web_index():
               }}
 
               if (mode === "none" || !prompt) {{
-                // 原生默认模式：显式传入空 system，使 Qwen 模板抑制默认角色；非 Qwen 模型由代理剥离
                 if (data.messages.length > 0 && data.messages[0].role === "system") {{
                   data.messages[0].content = "";
                 }} else {{
@@ -1187,7 +1118,6 @@ def update_web_index():
     return origFetch.apply(this, args);
   }};
 
-  // Mobile Thinking Chain Click / Tap Handler
   document.addEventListener("click", function(e) {{
     const summary = e.target.closest("summary");
     if (summary) {{
@@ -1198,7 +1128,6 @@ def update_web_index():
     }}
   }}, true);
 
-  // 初始化：优先拉取服务端实时状态
   syncWindowAndButton();
   refreshFromServer(false);
 }})();
@@ -1219,16 +1148,11 @@ def update_web_index():
 
 
 def sync_all_outputs():
-    """将当前激活角色同步到 Jinja 模板、web/roles.json 与 web/index.html"""
     _, name, prompt = get_active_prompt_info()
     update_jinja_identity(name, prompt)
     export_roles_json()
     update_web_index()
 
-
-# ---------------------------------------------------------------------------
-# 角色状态切换与 CRUD 业务方法（供 CLI 与 server_core.py REST API 共用）
-# ---------------------------------------------------------------------------
 
 def set_active_role(role_name_or_id, strict: bool = True, bump_launch: bool = True):
     roles = list_roles()
@@ -1253,7 +1177,7 @@ def set_active_role(role_name_or_id, strict: bool = True, bump_launch: bool = Tr
         if not strict and roles:
             target_name, target_prompt = roles[0]
         else:
-            return False, f"无效的角色编号或名称：{ref}（当前共有 {len(roles)} 个角色）"
+            return False, f"Invalid role number or name: {ref} ({len(roles)} roles available)"
 
     state = get_state()
     state["mode"] = MODE_PRESET
@@ -1281,7 +1205,7 @@ def set_active_none(bump_launch: bool = True):
 def set_active_temp(prompt: str, bump_launch: bool = True):
     clean = (prompt or "").strip()
     if not clean:
-        return False, "临时提示词不能为空"
+        return False, "Temporary prompt cannot be empty"
     state = get_state()
     state["mode"] = MODE_TEMP
     state["active_role"] = TEMP_TOKEN
@@ -1304,16 +1228,16 @@ def apply_current(bump_launch: bool = True):
 
 
 def add_role(name: str, prompt: str, activate: bool = False):
-    clean_name = (name or "").replace("[", "（").replace("]", "）").replace("\n", " ").strip()
+    clean_name = (name or "").replace("[", "(").replace("]", ")").replace("\n", " ").strip()
     clean_prompt = (prompt or "").strip()
     if not clean_name:
-        return False, "角色名称不能为空", None
+        return False, "Role name cannot be empty", None
     if not clean_prompt:
-        return False, "提示词内容不能为空", None
+        return False, "Prompt content cannot be empty", None
 
     roles = list_roles()
     if any(r[0].lower() == clean_name.lower() for r in roles):
-        return False, f"已存在同名角色「{clean_name}」，请换一个名称", None
+        return False, f"Role '{clean_name}' already exists; choose a different name", None
 
     roles.append((clean_name, clean_prompt))
     save_roles_to_file(roles)
@@ -1329,18 +1253,18 @@ def update_role(role_id: int, new_name: str, new_prompt: str, activate: bool = F
     roles = list_roles()
     idx = int(role_id) - 1
     if not (0 <= idx < len(roles)):
-        return False, f"角色编号 {role_id} 不存在"
+        return False, f"Role #{role_id} does not exist"
 
-    clean_name = (new_name or "").replace("[", "（").replace("]", "）").replace("\n", " ").strip()
+    clean_name = (new_name or "").replace("[", "(").replace("]", ")").replace("\n", " ").strip()
     clean_prompt = (new_prompt or "").strip()
     if not clean_name:
-        return False, "角色名称不能为空"
+        return False, "Role name cannot be empty"
     if not clean_prompt:
-        return False, "提示词内容不能为空"
+        return False, "Prompt content cannot be empty"
 
     for i, (rname, _) in enumerate(roles):
         if i != idx and rname.lower() == clean_name.lower():
-            return False, f"已存在同名角色「{clean_name}」"
+            return False, f"Role '{clean_name}' already exists"
 
     old_name = roles[idx][0]
     roles[idx] = (clean_name, clean_prompt)
@@ -1361,7 +1285,7 @@ def delete_role(role_id: int):
     roles = list_roles()
     idx = int(role_id) - 1
     if not (0 <= idx < len(roles)):
-        return False, f"角色编号 {role_id} 不存在"
+        return False, f"Role #{role_id} does not exist"
 
     removed_name = roles[idx][0]
     roles.pop(idx)
@@ -1380,21 +1304,16 @@ def delete_role(role_id: int):
     return True, removed_name
 
 
-# ---------------------------------------------------------------------------
-# 命令行交互式界面 (CLI UX)
-# ---------------------------------------------------------------------------
-
-def _snippet(text: str, max_len: int = 34) -> str:
+def _snippet(text: str, max_len: int = 38) -> str:
     flat = " ".join((text or "").split())
     return flat if len(flat) <= max_len else flat[:max_len] + "..."
 
 
 def _read_multiline_input(allow_empty_keep: bool = False):
     """
-    人性化多行输入：
-    - 输入或粘贴完毕后，直接按一次空行回车即可结束（同时兼容 Ctrl+Z）
-    - 第一行输入 0 并回车直接取消返回
-    返回值：(cancelled: bool, text: str)
+    User-friendly multiline input:
+    - Press Enter on an empty line when finished (also supports Ctrl+Z)
+    - Enter '0' on the first line to cancel
     """
     lines_in = []
     while True:
@@ -1421,24 +1340,23 @@ def _read_multiline_input(allow_empty_keep: bool = False):
 
 
 def list_roles_short_for_bat():
-    """--list-short：输出带编号与摘要的角色列表供 bat 菜单显示"""
     roles = list_roles()
     mode, display_name, temp_prompt = get_active_prompt_info()
 
     if mode == MODE_NONE:
-        _bat_write(f"  (当前已激活：{NONE_DISPLAY})\n\n")
+        _bat_write(f"  (Currently active: {NONE_DISPLAY})\n\n")
     elif mode == MODE_TEMP:
-        _bat_write(f"  (当前已激活：{TEMP_DISPLAY} — {_snippet(temp_prompt, 28)})\n\n")
+        _bat_write(f"  (Currently active: {TEMP_DISPLAY} - {_snippet(temp_prompt, 32)})\n\n")
 
     if not roles:
-        _bat_write("  (role_setting.txt 中暂无预设角色，可按 [M] 新增或按 [N] 原生启动)\n")
+        _bat_write("  (No preset roles in role_setting.txt. Press [M] to add or [N] for Native Default)\n")
         return
 
     for idx, (name, prompt) in enumerate(roles, 1):
         marker = " *" if (mode == MODE_PRESET and name == display_name) else ""
-        preview = _snippet(prompt, 32)
+        preview = _snippet(prompt, 38)
         _bat_write(f" [{idx}] {name}{marker}\n")
-        _bat_write(f"     └─ {preview}\n")
+        _bat_write(f"     -> {preview}\n")
 
 
 def apply_role_cli(role_id: str):
@@ -1447,7 +1365,7 @@ def apply_role_cli(role_id: str):
         _bat_write(f"OK:{msg}\n")
         sys.exit(0)
     else:
-        _bat_write(f"[提示] {msg}\n")
+        _bat_write(f"[Info] {msg}\n")
         sys.exit(1)
 
 
@@ -1469,26 +1387,25 @@ def get_current_name_cli():
 
 
 def custom_role_cli():
-    """--custom：人性化临时角色输入（空行回车结束、0 取消、可选转存永久）"""
     os.system("cls")
     _bat_write("============================================================\n")
-    _bat_write("            临时输入自定义角色设定 (仅本次生效)\n")
+    _bat_write("        Temporary Custom Role Prompt (This Session)\n")
     _bat_write("============================================================\n")
-    _bat_write(" * 支持直接粘贴单行或多行提示词\n")
-    _bat_write(" * 输入完成后，再按一次【回车】(输入空行) 即可完成\n")
-    _bat_write(" * 直接输入 0 并回车可取消并返回上一级菜单\n")
+    _bat_write(" * Paste or type a single-line or multi-line system prompt\n")
+    _bat_write(" * Press Enter on an empty line when finished\n")
+    _bat_write(" * Enter 0 and press Enter to cancel and go back\n")
     _bat_write("------------------------------------------------------------\n")
-    _bat_write("请输入提示词内容：\n")
+    _bat_write("Enter system prompt:\n")
 
     cancelled, prompt = _read_multiline_input(allow_empty_keep=False)
     if cancelled or not prompt:
-        _bat_write("\n[提示] 已取消临时输入，返回角色选择菜单...\n")
+        _bat_write("\n[Info] Cancelled temporary input, returning to role menu...\n")
         time.sleep(0.8)
         sys.exit(2)
 
     _bat_write("\n------------------------------------------------------------\n")
-    _bat_write(f"[已录入 {len(prompt)} 字] 预览：{_snippet(prompt, 48)}\n")
-    _bat_write("是否顺便保存为永久角色？(直接回车=仅本次临时生效，输入角色名=永久保存)：\n")
+    _bat_write(f"[Captured {len(prompt)} chars] Preview: {_snippet(prompt, 48)}\n")
+    _bat_write("Save as a permanent preset? (Enter=temp only, or type a Role Name):\n")
     try:
         save_name = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -1497,46 +1414,44 @@ def custom_role_cli():
     if save_name and save_name != "0":
         ok, msg, _ = add_role(save_name, prompt, activate=True)
         if ok:
-            # 同步刷新 launch_id
             apply_current(bump_launch=True)
-            _bat_write(f"\n[成功] 已永久保存并激活角色「{msg}」！\n")
+            _bat_write(f"\n[OK] Saved permanently and activated role '{msg}'!\n")
             time.sleep(0.8)
             sys.exit(0)
         else:
-            _bat_write(f"\n[提示] 永久保存失败（{msg}），已自动降级为本次临时生效。\n")
+            _bat_write(f"\n[Info] Could not save permanently ({msg}); applying for this session only.\n")
 
     set_active_temp(prompt, bump_launch=True)
-    _bat_write("\n[成功] 临时自定义角色已生效（同步支持桌面端与移动端 Web UI）！\n")
+    _bat_write("\n[OK] Temporary custom role activated (synced to Desktop & Mobile Web UI)!\n")
     time.sleep(0.8)
     sys.exit(0)
 
 
 def manage_roles_cli():
-    """--manage：可视化命令行角色管理中心（增/删/改/查 + Win11 兼容记事本编辑）"""
     while True:
         os.system("cls")
         roles = list_roles()
         mode, active_disp, _ = get_active_prompt_info()
 
         _bat_write("============================================================\n")
-        _bat_write("                    角色设定管理中心\n")
+        _bat_write("                  Role Preset Manager\n")
         _bat_write("============================================================\n")
         if not roles:
-            _bat_write("  (当前暂无角色，请按 [A] 新建角色)\n")
+            _bat_write("  (No preset roles yet. Press [A] to add one.)\n")
         else:
             for idx, (name, prompt) in enumerate(roles, 1):
                 mark = " *" if (mode == MODE_PRESET and name == active_disp) else ""
                 _bat_write(f"  [{idx}] {name}{mark}\n")
-                _bat_write(f"      └─ {_snippet(prompt, 40)}\n")
+                _bat_write(f"      -> {_snippet(prompt, 42)}\n")
 
         _bat_write("------------------------------------------------------------\n")
-        _bat_write("  [A] 新增角色          [E] 编辑指定角色\n")
-        _bat_write("  [V] 查看角色全文      [D] 删除指定角色\n")
-        _bat_write("  [O] 用记事本打开 role_setting.txt\n")
-        _bat_write("  [0] 返回角色选择菜单\n")
+        _bat_write("  [A] Add Role            [E] Edit Role\n")
+        _bat_write("  [V] View Full Prompt    [D] Delete Role\n")
+        _bat_write("  [O] Open role_setting.txt in Notepad\n")
+        _bat_write("  [0] Back to role selection menu\n")
         _bat_write("============================================================\n")
         try:
-            op = input("请选择操作: ").strip().upper()
+            op = input("Select action: ").strip().upper()
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -1544,28 +1459,28 @@ def manage_roles_cli():
             break
 
         elif op == "A":
-            _bat_write("\n--- 新增角色 (输入 0 取消) ---\n")
+            _bat_write("\n--- Add Role (0 to cancel) ---\n")
             try:
-                name = input("角色名称: ").strip()
+                name = input("Role name: ").strip()
             except (EOFError, KeyboardInterrupt):
                 continue
             if not name or name == "0":
                 continue
-            _bat_write("请输入提示词内容（输入完成后按空行回车结束，输入 0 取消）：\n")
+            _bat_write("Enter system prompt (empty line + Enter to finish, 0 to cancel):\n")
             cancelled, prompt = _read_multiline_input(allow_empty_keep=False)
             if cancelled or not prompt:
-                _bat_write("[提示] 已取消新增。\n")
+                _bat_write("[Info] Cancelled.\n")
                 time.sleep(0.8)
                 continue
             ok, msg, _ = add_role(name, prompt, activate=False)
-            _bat_write(f"[{'成功' if ok else '错误'}] {'已新增角色「' + msg + '」' if ok else msg}\n")
+            _bat_write(f"[{'OK' if ok else 'Error'}] {'Added role ' + msg if ok else msg}\n")
             time.sleep(1.0)
 
         elif op == "V":
             if not roles:
                 continue
             try:
-                idx_s = input(f"\n请输入要查看的角色编号 (1-{len(roles)}, 0取消): ").strip()
+                idx_s = input(f"\nEnter role number to view (1-{len(roles)}, 0 to cancel): ").strip()
             except (EOFError, KeyboardInterrupt):
                 continue
             if not idx_s.isdigit() or not (1 <= int(idx_s) <= len(roles)):
@@ -1573,12 +1488,12 @@ def manage_roles_cli():
             rname, rprompt = roles[int(idx_s) - 1]
             os.system("cls")
             _bat_write("============================================================\n")
-            _bat_write(f" 角色名称：{rname}\n")
+            _bat_write(f" Role Name: {rname}\n")
             _bat_write("------------------------------------------------------------\n")
             _bat_write(rprompt + "\n")
             _bat_write("============================================================\n")
             try:
-                input("按回车键返回管理菜单...")
+                input("Press Enter to return...")
             except (EOFError, KeyboardInterrupt):
                 pass
 
@@ -1586,36 +1501,36 @@ def manage_roles_cli():
             if not roles:
                 continue
             try:
-                idx_s = input(f"\n请输入要编辑的角色编号 (1-{len(roles)}, 0取消): ").strip()
+                idx_s = input(f"\nEnter role number to edit (1-{len(roles)}, 0 to cancel): ").strip()
             except (EOFError, KeyboardInterrupt):
                 continue
             if not idx_s.isdigit() or not (1 <= int(idx_s) <= len(roles)):
                 continue
             rid = int(idx_s)
             old_name, old_prompt = roles[rid - 1]
-            _bat_write(f"\n--- 编辑角色 [{rid}] {old_name} ---\n")
-            _bat_write(f"当前提示词：\n{old_prompt}\n")
+            _bat_write(f"\n--- Editing [{rid}] {old_name} ---\n")
+            _bat_write(f"Current prompt:\n{old_prompt}\n")
             _bat_write("------------------------------------------------------------\n")
             try:
-                new_name = input(f"新角色名称 (直接回车保持「{old_name}」): ").strip() or old_name
+                new_name = input(f"New name (Enter to keep '{old_name}'): ").strip() or old_name
             except (EOFError, KeyboardInterrupt):
                 continue
-            _bat_write("请输入新提示词（直接回车保持原内容；输入新内容后按空行回车结束，0取消）：\n")
+            _bat_write("Enter new prompt (Enter on empty line to keep existing, or finish new text; 0 to cancel):\n")
             cancelled, new_prompt = _read_multiline_input(allow_empty_keep=True)
             if cancelled:
-                _bat_write("[提示] 已取消编辑。\n")
+                _bat_write("[Info] Edit cancelled.\n")
                 time.sleep(0.8)
                 continue
             final_prompt = new_prompt if new_prompt else old_prompt
             ok, msg = update_role(rid, new_name, final_prompt, activate=False)
-            _bat_write(f"[{'成功' if ok else '错误'}] {'已更新角色「' + msg + '」' if ok else msg}\n")
+            _bat_write(f"[{'OK' if ok else 'Error'}] {'Updated role ' + msg if ok else msg}\n")
             time.sleep(1.0)
 
         elif op == "D":
             if not roles:
                 continue
             try:
-                idx_s = input(f"\n请输入要删除的角色编号 (1-{len(roles)}, 0取消): ").strip()
+                idx_s = input(f"\nEnter role number to delete (1-{len(roles)}, 0 to cancel): ").strip()
             except (EOFError, KeyboardInterrupt):
                 continue
             if not idx_s.isdigit() or not (1 <= int(idx_s) <= len(roles)):
@@ -1623,12 +1538,12 @@ def manage_roles_cli():
             rid = int(idx_s)
             target_name = roles[rid - 1][0]
             try:
-                confirm = input(f"确认永久删除角色「{target_name}」？(输入 y 确认，回车取消): ").strip().lower()
+                confirm = input(f"Permanently delete role '{target_name}'? (type 'y' to confirm, Enter to cancel): ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 continue
             if confirm == "y":
                 ok, msg = delete_role(rid)
-                _bat_write(f"[{'成功' if ok else '错误'}] {'已删除角色「' + msg + '」' if ok else msg}\n")
+                _bat_write(f"[{'OK' if ok else 'Error'}] {'Deleted role ' + msg if ok else msg}\n")
                 time.sleep(1.0)
 
         elif op == "O":
@@ -1636,17 +1551,17 @@ def manage_roles_cli():
                 save_roles_to_file([])
             try:
                 subprocess.Popen(["notepad.exe", TXT_PATH])
-                _bat_write("\n[提示] 已用记事本打开 role_setting.txt！\n")
-                _bat_write("       请在记事本中编辑并按 Ctrl+S 保存，完成后回到此处按【回车键】刷新列表...\n")
+                _bat_write("\n[Info] Opened role_setting.txt in Notepad!\n")
+                _bat_write("       Edit and save (Ctrl+S), then return here and press [Enter] to reload...\n")
                 try:
                     input()
                 except (EOFError, KeyboardInterrupt):
                     pass
                 sync_all_outputs()
-                _bat_write("[成功] 已重新解析 role_setting.txt 并同步刷新网页缓存！\n")
+                _bat_write("[OK] Reloaded role_setting.txt and synced Web UI cache!\n")
                 time.sleep(0.8)
             except Exception as e:
-                _bat_write(f"[错误] 无法打开记事本: {e}\n")
+                _bat_write(f"[Error] Could not open Notepad: {e}\n")
                 time.sleep(1.2)
 
 

@@ -1,12 +1,15 @@
 # ====================================================================
-# 外部大模型目录配置文件 (Model Directories Configuration)
+# External Model Directories Configuration (model_dirs.txt)
 # ====================================================================
-# 【说明】：
-# 1. 软件每次启动时，会自动扫描程序根目录下的 models 文件夹以及本文件配置的外部目录。
-# 2. 支持直接加载其他分区、机械硬盘或移动硬盘中的 .gguf 模型，无需跨盘复制！
-# 3. 每行填写一个文件夹绝对路径；以 # 开头的行代表注释，将被自动忽略。
+# Notes:
+# 1. On startup, the launcher automatically scans the local `models/`
+#    folder as well as every directory listed in this file.
+# 2. Load .gguf models directly from HDDs, external drives, or other
+#    partitions without copying large 20-50 GB files around.
+# 3. Put one absolute folder path per line. Lines starting with # are
+#    comments and will be ignored.
 # ====================================================================
 
-# 示例（取消下方注释并改为你的实际模型路径即可生效）：
+# Examples (uncomment and change to your actual model directories):
 # D:\AI\Models
-# I:\模型
+# E:\GGUF-Library

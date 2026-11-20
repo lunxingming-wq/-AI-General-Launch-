@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-显存与内存深度腾退优化器 (Memory & VRAM Optimizer)
+Memory & VRAM Optimizer
+- Suspends Wallpaper Engine playback during inference to free VRAM/GPU render load
+- Trims background process working sets via Win32 EmptyWorkingSet
+- Triggers a CUDA allocation pulse to evict stale DX/desktop VRAM caches
+- Launches a detached background guardian to guarantee Wallpaper Engine resumes
+  even if the console window is closed directly via [X] or Ctrl+C.
 """
 
 import os
@@ -20,6 +25,7 @@ STILL_ACTIVE = 259
 TARGET_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(TARGET_DIR, ".optimizer_state.json")
 
+
 def _detect_console_encoding():
     try:
         cp = ctypes.windll.kernel32.GetConsoleOutputCP()
@@ -29,9 +35,11 @@ def _detect_console_encoding():
             return "utf-8"
         return f"cp{cp}"
     except Exception:
-        return "gbk"
+        return "utf-8"
+
 
 _CONSOLE_ENC = _detect_console_encoding()
+
 
 def _bat_write(text: str) -> None:
     try:
@@ -52,18 +60,20 @@ def _bat_write(text: str) -> None:
         except Exception:
             pass
 
+
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [
-        ('dwLength', ctypes.c_ulong),
-        ('dwMemoryLoad', ctypes.c_ulong),
-        ('ullTotalPhys', ctypes.c_ulonglong),
-        ('ullAvailPhys', ctypes.c_ulonglong),
-        ('ullTotalPageFile', ctypes.c_ulonglong),
-        ('ullAvailPageFile', ctypes.c_ulonglong),
-        ('ullTotalVirtual', ctypes.c_ulonglong),
-        ('ullAvailVirtual', ctypes.c_ulonglong),
-        ('sullAvailExtendedVirtual', ctypes.c_ulonglong),
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
     ]
+
 
 def get_ram_info():
     stat = MEMORYSTATUSEX()
@@ -74,19 +84,23 @@ def get_ram_info():
     used_gb = round(total_gb - avail_gb, 1)
     return total_gb, avail_gb, used_gb
 
+
 def get_vram_info():
     try:
         out = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.total,memory.used,memory.free', '--format=csv,noheader,nounits'],
-            encoding='utf-8', errors='ignore', timeout=2
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"],
+            encoding="utf-8",
+            errors="ignore",
+            timeout=2,
         )
-        parts = [float(x.strip()) for x in out.strip().split(',')]
+        parts = [float(x.strip()) for x in out.strip().split(",")]
         total_gb = round(parts[0] / 1024.0, 1)
         used_gb = round(parts[1] / 1024.0, 1)
         free_gb = round(parts[2] / 1024.0, 1)
         return total_gb, free_gb, used_gb
     except Exception:
         return 12.0, 10.0, 2.0
+
 
 def is_pid_alive(pid: int) -> bool:
     if pid <= 0:
@@ -103,15 +117,19 @@ def is_pid_alive(pid: int) -> bool:
     finally:
         kernel32.CloseHandle(h_proc)
 
+
 def is_process_running(process_name: str) -> bool:
     try:
         out = subprocess.check_output(
-            ['tasklist', '/FI', f'IMAGENAME eq {process_name}', '/FO', 'CSV'],
-            encoding='gbk', errors='ignore', timeout=3
+            ["tasklist", "/FI", f"IMAGENAME eq {process_name}", "/FO", "CSV"],
+            encoding="utf-8",
+            errors="ignore",
+            timeout=3,
         )
         return process_name.lower() in out.lower()
     except Exception:
         return False
+
 
 def get_process_path(pid: int) -> str:
     kernel32 = ctypes.windll.kernel32
@@ -127,16 +145,20 @@ def get_process_path(pid: int) -> str:
         kernel32.CloseHandle(h_proc)
     return ""
 
+
 def is_wallpaper_running() -> bool:
     return is_process_running("wallpaper64.exe") or is_process_running("wallpaper32.exe")
 
+
 def find_wallpaper_engine() -> str:
-    # 1. 直接查询当前正在运行的壁纸引擎进程 (64位或32位)
-    for exe in ('wallpaper64.exe', 'wallpaper32.exe'):
+    # 1. Query active running Wallpaper Engine processes (64-bit / 32-bit)
+    for exe in ("wallpaper64.exe", "wallpaper32.exe"):
         try:
             out = subprocess.check_output(
-                ['tasklist', '/FI', f'IMAGENAME eq {exe}', '/FO', 'CSV'],
-                encoding='gbk', errors='ignore', timeout=2
+                ["tasklist", "/FI", f"IMAGENAME eq {exe}", "/FO", "CSV"],
+                encoding="utf-8",
+                errors="ignore",
+                timeout=2,
             )
             reader = csv.reader(io.StringIO(out))
             next(reader, None)
@@ -152,30 +174,31 @@ def find_wallpaper_engine() -> str:
         except Exception:
             pass
 
-    # 2. 查询 Windows 服务 ImagePath (Wallpaper Engine Service 常驻服务中记录的主程序绝对路径)
+    # 2. Query Windows Service ImagePath
     try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Services\Wallpaper Engine Service') as k:
-            val, _ = winreg.QueryValueEx(k, 'ImagePath')
-            if '-p' in val:
-                p = val.split('-p')[1].strip(' "\'')
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\Wallpaper Engine Service") as k:
+            val, _ = winreg.QueryValueEx(k, "ImagePath")
+            if "-p" in val:
+                p = val.split("-p")[1].strip(" \"'")
                 if os.path.exists(p):
                     return p
     except Exception:
         pass
 
-    # 3. 遍历全盘常见 Steam 库路径
-    drives = [chr(c) for c in range(ord('C'), ord('Z')+1)]
+    # 3. Scan common Steam library locations across drives
+    drives = [chr(c) for c in range(ord("C"), ord("Z") + 1)]
     for d in drives:
         for sub in (
-            rf'{d}:\SteamLibrary\steamapps\common\wallpaper_engine\wallpaper64.exe',
-            rf'{d}:\SteamLibrary\steamapps\common\wallpaper_engine\wallpaper32.exe',
-            rf'{d}:\Program Files (x86)\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe',
-            rf'{d}:\Program Files\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe',
+            rf"{d}:\SteamLibrary\steamapps\common\wallpaper_engine\wallpaper64.exe",
+            rf"{d}:\SteamLibrary\steamapps\common\wallpaper_engine\wallpaper32.exe",
+            rf"{d}:\Program Files (x86)\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe",
+            rf"{d}:\Program Files\Steam\steamapps\common\wallpaper_engine\wallpaper64.exe",
         ):
             if os.path.exists(sub):
                 return sub
 
     return ""
+
 
 def pause_wallpaper_engine() -> str:
     wp_path = find_wallpaper_engine()
@@ -189,7 +212,7 @@ def pause_wallpaper_engine() -> str:
                 cwd=wp_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
+                stdin=subprocess.DEVNULL,
             )
             try:
                 p.wait(timeout=3)
@@ -199,6 +222,7 @@ def pause_wallpaper_engine() -> str:
         except Exception:
             pass
     return None
+
 
 def resume_wallpaper_engine(wp_path=None) -> bool:
     if not wp_path or not os.path.exists(wp_path):
@@ -213,24 +237,24 @@ def resume_wallpaper_engine(wp_path=None) -> bool:
                 cwd=wp_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
+                stdin=subprocess.DEVNULL,
             )
             try:
                 p.wait(timeout=3)
             except Exception:
                 pass
         else:
-            # 若壁纸主程序未在运行，直接重启拉起
             subprocess.Popen(
                 [wp_path],
                 cwd=wp_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
+                stdin=subprocess.DEVNULL,
             )
         return True
     except Exception:
         return False
+
 
 def trim_all_process_working_sets():
     kernel32 = ctypes.windll.kernel32
@@ -240,7 +264,7 @@ def trim_all_process_working_sets():
 
     trimmed_count = 0
     try:
-        out = subprocess.check_output(['tasklist', '/FO', 'CSV'], encoding='gbk', errors='ignore', timeout=3)
+        out = subprocess.check_output(["tasklist", "/FO", "CSV"], encoding="utf-8", errors="ignore", timeout=3)
         reader = csv.reader(io.StringIO(out))
         next(reader, None)
         for row in reader:
@@ -250,27 +274,28 @@ def trim_all_process_working_sets():
                     pid = int(row[1])
                 except Exception:
                     continue
-                if pid <= 4 or name in ('system', 'idle', 'csrss.exe', 'smss.exe', 'lsass.exe', 'services.exe', 'wininit.exe'):
+                if pid <= 4 or name in ("system", "idle", "csrss.exe", "smss.exe", "lsass.exe", "services.exe", "wininit.exe"):
                     continue
-                hProc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
-                if hProc:
-                    if psapi.EmptyWorkingSet(hProc):
+                h_proc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
+                if h_proc:
+                    if psapi.EmptyWorkingSet(h_proc):
                         trimmed_count += 1
-                    kernel32.CloseHandle(hProc)
+                    kernel32.CloseHandle(h_proc)
     except Exception:
         pass
     return trimmed_count
+
 
 def trigger_cuda_vram_pulse():
     try:
         cuda = ctypes.windll.nvcuda
         if cuda.cuInit(0) != 0:
             return False
-        pDev = ctypes.c_int()
-        if cuda.cuDeviceGet(ctypes.byref(pDev), 0) != 0:
+        p_dev = ctypes.c_int()
+        if cuda.cuDeviceGet(ctypes.byref(p_dev), 0) != 0:
             return False
-        pCtx = ctypes.c_void_p()
-        if cuda.cuCtxCreate_v2(ctypes.byref(pCtx), 0, pDev.value) != 0:
+        p_ctx = ctypes.c_void_p()
+        if cuda.cuCtxCreate_v2(ctypes.byref(p_ctx), 0, p_dev.value) != 0:
             return False
 
         free_m = ctypes.c_size_t()
@@ -278,14 +303,15 @@ def trigger_cuda_vram_pulse():
         if cuda.cuMemGetInfo_v2(ctypes.byref(free_m), ctypes.byref(total_m)) == 0:
             alloc_bytes = int(free_m.value * 0.90)
             if alloc_bytes > 512 * 1024 * 1024:
-                pMem = ctypes.c_ulonglong()
-                if cuda.cuMemAlloc_v2(ctypes.byref(pMem), ctypes.c_size_t(alloc_bytes)) == 0:
+                p_mem = ctypes.c_ulonglong()
+                if cuda.cuMemAlloc_v2(ctypes.byref(p_mem), ctypes.c_size_t(alloc_bytes)) == 0:
                     time.sleep(0.2)
-                    cuda.cuMemFree_v2(pMem)
-        cuda.cuCtxDestroy_v2(pCtx)
+                    cuda.cuMemFree_v2(p_mem)
+        cuda.cuCtxDestroy_v2(p_ctx)
         return True
     except Exception:
         return False
+
 
 def print_menu_banner(model_name=None, model_size=None):
     ram_tot, ram_avail, ram_used = get_ram_info()
@@ -293,11 +319,11 @@ def print_menu_banner(model_name=None, model_size=None):
     wp_path = find_wallpaper_engine()
     wp_running = is_wallpaper_running()
     if wp_path and wp_running:
-        wp_desc = "Wallpaper Engine 运行中 (优化时将自动暂停腾出显存，运行结束自动恢复)"
+        wp_desc = "Wallpaper Engine running (auto-pauses during run, auto-resumes after exit)"
     elif wp_path:
-        wp_desc = "Wallpaper Engine 已安装 (当前未处于运行状态)"
+        wp_desc = "Wallpaper Engine installed (currently not running)"
     else:
-        wp_desc = "未检测到运行"
+        wp_desc = "Not detected"
 
     r1_min = max(3.0, round(ram_used * 0.55, 1))
     r1_max = max(r1_min + 1.5, round(ram_used * 0.85, 1))
@@ -314,38 +340,39 @@ def print_menu_banner(model_name=None, model_size=None):
 
     lines = [
         "============================================================",
-        "               显存与内存深度腾退优化",
-        "============================================================"
+        "               Memory & VRAM Deep Optimizer",
+        "============================================================",
     ]
     if model_name:
-        clean_name = model_name.strip('\"\' ')
-        clean_size = model_size.strip('\"\' ') if model_size else ""
+        clean_name = model_name.strip("\"' ")
+        clean_size = model_size.strip("\"' ") if model_size else ""
         size_str = f" ({clean_size})" if clean_size else ""
-        lines.append(f" 当前选定模型: {clean_name}{size_str}")
+        lines.append(f" Selected Model: {clean_name}{size_str}")
         lines.append("------------------------------------------------------------")
 
     lines.extend([
-        " 当前系统物理资源状态:",
-        f"  - 物理内存: 总共 {ram_tot:.1f} GB | 当前可用: {ram_avail:.1f} GB (已被后台占用: {ram_used:.1f} GB)",
-        f"  - 显卡显存: 总共 {vram_tot:.1f} GB | 当前可用: {vram_free:.1f} GB (已被后台占用: {vram_used:.1f} GB)",
-        f"  - 动态壁纸: {wp_desc}",
+        " Current System Hardware Status:",
+        f"  - System RAM : Total {ram_tot:.1f} GB | Free {ram_avail:.1f} GB (In Use: {ram_used:.1f} GB)",
+        f"  - GPU VRAM   : Total {vram_tot:.1f} GB | Free {vram_free:.1f} GB (In Use: {vram_used:.1f} GB)",
+        f"  - Live BG    : {wp_desc}",
         "------------------------------------------------------------",
-        " 请选择是否在配置策略前腾退后台占用？",
-        " (腾退出的显存与内存将直接用于后续加载更多显卡层数与计算更长上下文！)",
+        " Reclaim background RAM & VRAM before calculating model layers?",
+        " (Freed memory directly unlocks more GPU layers and larger context)",
         "",
-        f" [1] 一键极速深度强力腾退 (强烈推荐)  [预计释放: 内存 +{r1_min}~{r1_max} GB | 显存 +{v1_min}~{v1_max} GB]",
-        "     * 动作: 挂起动态壁纸 + 200+个后台进程内存强制清空工作集 + 脉冲CUDA显存置换",
-        f" [2] 终极极限深挖腾退 (最强模式)  [预计释放: 内存 +{r2_min}~{r2_max} GB | 显存 +{v2_min}~{v2_max} GB]",
-        "     * 动作: 在[1]基础上，自动检测/关闭高显存与内存后台非核心常驻进程",
-        f" [3] 温和工作集优化 (只清内存)  [预计释放: 内存 +{r3_min}~{r3_max} GB | 显存 +0 GB (不动显存)]",
-        "     * 动作: 仅清空全系统进程内存工作集，全显存与动态壁纸保持原状",
-        " [4] 原汁原味启动 (不优化)  [释放: 内存 +0 GB | 显存 +0 GB (维持现状)]",
-        "     * 动作: 不做任何系统干预，后续按当前现有剩余显存与内存保守计算",
+        f" [1] Fast Deep Cleanup (Recommended)   [Est. Freed: RAM +{r1_min}~{r1_max} GB | VRAM +{v1_min}~{v1_max} GB]",
+        "     * Pause Wallpaper Engine + Trim 200+ process working sets + CUDA VRAM pulse",
+        f" [2] Aggressive Extreme Cleanup        [Est. Freed: RAM +{r2_min}~{r2_max} GB | VRAM +{v2_min}~{v2_max} GB]",
+        "     * Everything in [1] + close non-essential heavy background apps",
+        f" [3] Gentle RAM-Only Trim              [Est. Freed: RAM +{r3_min}~{r3_max} GB | VRAM +0 GB]",
+        "     * Trim system working sets only; keep VRAM and wallpapers untouched",
+        " [4] Skip Cleanup (As-Is Launch)       [Freed: RAM +0 GB | VRAM +0 GB]",
+        "     * Leave background apps untouched and budget conservatively",
         "------------------------------------------------------------",
-        " [0] 返回重新选择模型",
-        "============================================================"
+        " [0] Back to model selection",
+        "============================================================",
     ])
     _bat_write("\n".join(lines) + "\n")
+
 
 def start_guardian(parent_pid: int, wp_path: str):
     if not parent_pid or not wp_path:
@@ -361,50 +388,44 @@ def start_guardian(parent_pid: int, wp_path: str):
             close_fds=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL
+            stdin=subprocess.DEVNULL,
         )
     except Exception:
         pass
 
+
 def run_guardian(parent_pid: int, wp_path: str):
     """
-    后台常驻守护进程：
-    持续监控启动器 CMD 窗口与 llama-server.exe 的存活状态。
-    无论用户通过关闭窗口 [X]、Ctrl+C 中断、异常崩溃或直接退出，
-    只要启动器进程死亡，立刻第一时间无条件恢复动态壁纸！
+    Detached background guardian: monitors launcher CMD PID and llama-server.
+    If the console exits abnormally ([X], Ctrl+C, crash), resumes Wallpaper Engine.
     """
     while True:
         time.sleep(1.0)
 
-        # 1. 如果正常流程已调用 restore() (状态文件被正常清理)，守护完成使命退出
         if not os.path.exists(STATE_FILE):
             break
 
-        # 2. 如果启动器 CMD 窗口已经关闭 (用户点击了 [X] 或被终止)
         if not is_pid_alive(parent_pid):
-            # 稍作等待，看 llama-server 是否随控制台关闭退出
             for _ in range(3):
                 if not is_process_running("llama-server.exe"):
                     break
                 time.sleep(1.0)
 
-            # 若仍有孤儿 llama-server 残留，清理它以防显存泄漏
             if is_process_running("llama-server.exe"):
                 try:
                     subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
                 except Exception:
                     pass
 
-            # 立刻无条件恢复壁纸引擎！
             resume_wallpaper_engine(wp_path)
 
-            # 清理状态文件并退出
             try:
                 if os.path.exists(STATE_FILE):
                     os.remove(STATE_FILE)
             except Exception:
                 pass
             break
+
 
 def run_optimization(mode):
     ram_tot, ram_avail_before, _ = get_ram_info()
@@ -413,14 +434,13 @@ def run_optimization(mode):
     wp_paused = False
     wp_path = None
 
-    _bat_write("\n[正在执行显存与内存深度优化，请稍候...]\n")
+    _bat_write("\n[Running VRAM & RAM deep optimization, please wait...]\n")
 
     if mode in ("1", "2"):
         wp_path = pause_wallpaper_engine()
         if wp_path:
             wp_paused = True
-            _bat_write("  [+] 成功挂起 Wallpaper Engine 动态壁纸 (释放常驻显存与GPU渲染)\n")
-            # 启动独立守护进程：即便后续用户点右上角 [X] 关闭窗口，也会自动恢复壁纸
+            _bat_write("  [+] Paused Wallpaper Engine (freed resident GPU render & VRAM)\n")
             try:
                 parent_pid = os.getppid()
                 start_guardian(parent_pid, wp_path)
@@ -438,20 +458,20 @@ def run_optimization(mode):
             except Exception:
                 pass
         if killed:
-            _bat_write(f"  [+] 已清理后台非核心高占用应用: {', '.join(killed)}\n")
+            _bat_write(f"  [+] Closed non-essential heavy background apps: {', '.join(killed)}\n")
 
     trimmed = trim_all_process_working_sets()
-    _bat_write(f"  [+] 已强制压缩并释放 {trimmed} 个后台进程的内存工作集\n")
+    _bat_write(f"  [+] Compressed and trimmed working sets for {trimmed} background processes\n")
 
     if mode in ("1", "2"):
         if trigger_cuda_vram_pulse():
-            _bat_write("  [+] 已触发 CUDA 显存脉冲，逼退后台 DirectX 显存缓存\n")
+            _bat_write("  [+] Triggered CUDA VRAM allocation pulse to evict stale DirectX caches\n")
 
     state = {
         "wp_paused": wp_paused,
         "wp_path": wp_path,
         "mode": mode,
-        "time": time.time()
+        "time": time.time(),
     }
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -466,9 +486,10 @@ def run_optimization(mode):
     freed_ram = max(0.0, ram_avail_after - ram_avail_before)
 
     _bat_write("------------------------------------------------------------\n")
-    _bat_write(f"[优化完成] 物理内存可用: {ram_avail_after:.1f} GB (成功腾退 +{freed_ram:.1f} GB 内存!)\n")
-    _bat_write(f"           显卡显存空闲: {vram_free_after:.1f} GB / {vram_tot:.1f} GB\n")
+    _bat_write(f"[Done] Free System RAM : {ram_avail_after:.1f} GB (+{freed_ram:.1f} GB reclaimed)\n")
+    _bat_write(f"       Free GPU VRAM   : {vram_free_after:.1f} GB / {vram_tot:.1f} GB\n")
     _bat_write("============================================================\n\n")
+
 
 def restore():
     wp_path = None
@@ -489,7 +510,8 @@ def restore():
 
     if wp_path:
         if resume_wallpaper_engine(wp_path):
-            _bat_write("[提示] 已自动恢复 Wallpaper Engine 动态壁纸播放。\n")
+            _bat_write("[Info] Automatically resumed Wallpaper Engine playback.\n")
+
 
 def main():
     if len(sys.argv) > 1:
@@ -512,6 +534,6 @@ def main():
     else:
         print_menu_banner()
 
+
 if __name__ == "__main__":
     main()
-

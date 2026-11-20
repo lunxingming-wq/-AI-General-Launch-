@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Local LLM Server Core & Web Hub
-- 根路径 / 提供移动端手机扫码自适应全功能 Web UI
-- 全量服务端持久化存储 (SQLite WAL 高并发)
-- 主动停止生成接口 /api/chat/stop
-- 多模态图片上传 (OpenAI Vision 规范)
-- 阅后即焚安全分享
+- Root path / serves the official Web UI (web/index.html) or mobile fallback
+- /mobile (/m) provides a responsive mobile Web UI with role management
+- Persistent server-side storage (SQLite WAL high-concurrency)
+- Active generation cancellation via /api/chat/stop
+- Multimodal image upload (OpenAI Vision spec)
+- Burn-after-reading one-time conversation share links
 """
 
 import os
@@ -48,29 +49,29 @@ app.add_middleware(
 if os.path.exists(os.path.join(WEB_DIR, "_app")):
     app.mount("/_app", StaticFiles(directory=os.path.join(WEB_DIR, "_app")), name="_app")
 
-# 活跃生成任务字典: msg_id -> asyncio.Task
+# Active generation tasks: msg_id -> asyncio.Task
 active_generation_tasks: Dict[str, asyncio.Task] = {}
-# 会话活跃生成映射: conv_id -> msg_id
+# Conversation active generation mapping: conv_id -> msg_id
 active_conv_to_msg: Dict[str, str] = {}
 
 # =====================================================
-# 1. 会话与消息管理 API
+# 1. Conversation & Message Management API
 # =====================================================
 
 @app.get("/api/conversations")
 async def get_conversations():
     convs = db_manager.list_conversations()
     if not convs:
-        cid = db_manager.create_conversation("新对话")
+        db_manager.create_conversation("New Chat")
         convs = db_manager.list_conversations()
     return {"status": "ok", "conversations": convs}
 
 @app.post("/api/conversations")
 async def create_new_conversation(req: Request):
     data = await req.json()
-    title = data.get("title", "新对话")
-    role_name = data.get("role_name", "通用智能助手")
-    folder = data.get("folder", "默认分类")
+    title = data.get("title", "New Chat")
+    role_name = data.get("role_name", "Default Assistant")
+    folder = data.get("folder", "Default")
     conv_id = db_manager.create_conversation(title=title, role_name=role_name, folder=folder)
     return {"status": "ok", "conv_id": conv_id}
 
@@ -78,7 +79,7 @@ async def create_new_conversation(req: Request):
 async def get_conversation_detail(conv_id: str):
     conv = db_manager.get_conversation(conv_id)
     if not conv:
-        raise HTTPException(status_code=404, detail="会话不存在")
+        raise HTTPException(status_code=404, detail="Conversation not found")
     messages = db_manager.get_messages(conv_id)
     return {"status": "ok", "conversation": conv, "messages": messages}
 
@@ -97,7 +98,7 @@ async def delete_conv(conv_id: str):
     return {"status": "ok"}
 
 # =====================================================
-# 2. 核心聊天推流与后台存盘 (支持多模态 + 高级采样参数)
+# 2. Core Chat Streaming & Persistence (Multimodal + Sampling)
 # =====================================================
 
 async def run_server_side_chat(conv_id: str, assistant_msg_id: str, messages_payload: List[Dict], sampling_params: Dict, client_queue: asyncio.Queue):
@@ -123,7 +124,7 @@ async def run_server_side_chat(conv_id: str, assistant_msg_id: str, messages_pay
             async with client.post(f"{LLAMA_BACKEND_URL}/v1/chat/completions", json=llama_req_body) as resp:
                 if resp.status != 200:
                     err_txt = await resp.text()
-                    err_msg = f"[LLaMA 引擎错误 {resp.status}]: {err_txt}"
+                    err_msg = f"[LLaMA Engine Error {resp.status}]: {err_txt}"
                     db_manager.update_message(assistant_msg_id, content=err_msg, is_complete=1)
                     await client_queue.put(f"data: {json.dumps({'error': err_msg})}\n\n")
                     return
@@ -176,9 +177,9 @@ async def run_server_side_chat(conv_id: str, assistant_msg_id: str, messages_pay
                             except Exception:
                                 pass
     except asyncio.CancelledError:
-        full_raw += "\n[已停止生成]"
+        full_raw += "\n[Generation stopped]"
     except Exception as e:
-        full_raw += f"\n[后台生成异常: {e}]"
+        full_raw += f"\n[Background generation error: {e}]"
     finally:
         cur_think, cur_cont = separate_thinking_and_content(full_raw, full_thinking)
         elapsed = round(time.time() - t0, 1)
@@ -198,9 +199,9 @@ async def run_server_side_chat(conv_id: str, assistant_msg_id: str, messages_pay
         active_conv_to_msg.pop(conv_id, None)
 
 def _resolve_role_system_prompt(role_name: str) -> Optional[str]:
-    """根据前端传入的角色名解析系统提示词；原生默认模式返回 None（不注入 system）"""
+    """Resolve system prompt by frontend role name; returns None in Native Default mode (no system injection)."""
     r = (role_name or "").strip()
-    if r in (role_manager.NONE_TOKEN, role_manager.NONE_DISPLAY, "原生默认"):
+    if r in (role_manager.NONE_TOKEN, role_manager.NONE_DISPLAY, "Native Default", "原生默认"):
         return None
     if r in (role_manager.TEMP_TOKEN, role_manager.TEMP_DISPLAY):
         mode, _, prompt = role_manager.get_active_prompt_info()
@@ -224,13 +225,13 @@ async def send_chat_message(req: Request):
     image_base64 = data.get("image_base64")
 
     if not conv_id or (not user_prompt and not image_base64):
-        raise HTTPException(status_code=400, detail="缺少 conv_id 或 内容 (prompt / image)")
+        raise HTTPException(status_code=400, detail="Missing conv_id or content (prompt / image)")
 
-    display_prompt = user_prompt if user_prompt else "[发送了图片]"
+    display_prompt = user_prompt if user_prompt else "[Image sent]"
     user_msg_id = db_manager.add_message(conv_id, role="user", content=display_prompt)
 
     conv = db_manager.get_conversation(conv_id)
-    if conv and conv.get("title") in ("新对话",):
+    if conv and conv.get("title") in ("New Chat", "新对话"):
         short_title = display_prompt[:16] + ("..." if len(display_prompt) > 16 else "")
         db_manager.update_conversation(conv_id, title=short_title)
 
@@ -241,17 +242,17 @@ async def send_chat_message(req: Request):
     if system_prompt:
         payload_msgs.append({"role": "system", "content": system_prompt})
     elif os.environ.get("LLAMA_CUSTOM_TEMPLATE") == "1":
-        # Qwen 自定义模板模式下传空 system 以抑制启动时写入的默认角色
+        # Send empty system message in custom template mode to override default role baked at startup
         payload_msgs.append({"role": "system", "content": ""})
 
-    # 构建历史消息 (末条包含多模态图片处理)
+    # Build message history (excluding latest message handled separately for Vision)
     for m in history_msgs[:-1]:
         payload_msgs.append({
             "role": m["role"],
             "content": m["content"]
         })
 
-    # 最新一条消息：若有图片，组装多模态 Vision 结构
+    # Latest message: assemble multimodal Vision structure if image is attached
     if image_base64:
         content_items = []
         if user_prompt:
@@ -290,7 +291,7 @@ async def send_chat_message(req: Request):
         }
     )
 
-# 重新生成上一条接口
+# Regenerate last assistant response
 @app.post("/api/chat/regenerate")
 async def regenerate_last_message(req: Request):
     data = await req.json()
@@ -299,13 +300,13 @@ async def regenerate_last_message(req: Request):
     sampling = data.get("sampling", {})
 
     if not conv_id:
-        raise HTTPException(status_code=400, detail="缺少 conv_id")
+        raise HTTPException(status_code=400, detail="Missing conv_id")
 
     msgs = db_manager.get_messages(conv_id)
     if not msgs:
-        raise HTTPException(status_code=400, detail="没有历史消息可重新生成")
+        raise HTTPException(status_code=400, detail="No message history to regenerate")
 
-    # 如果最后一条是 assistant，先重置它
+    # Reset last message if it is from assistant
     if msgs[-1]["role"] == "assistant":
         last_id = msgs[-1]["id"]
         assistant_msg_id = last_id
@@ -351,7 +352,7 @@ async def regenerate_last_message(req: Request):
         }
     )
 
-# 停止生成接口 (取消后台异步任务)
+# Stop active generation task
 @app.post("/api/chat/stop")
 async def stop_chat_generation(req: Request):
     data = await req.json()
@@ -366,11 +367,11 @@ async def stop_chat_generation(req: Request):
         active_generation_tasks.pop(target_msg_id, None)
         if conv_id:
             active_conv_to_msg.pop(conv_id, None)
-        return {"status": "ok", "message": "已成功主动取消推理任务"}
-    return {"status": "ok", "message": "无正在运行的任务"}
+        return {"status": "ok", "message": "Generation task cancelled"}
+    return {"status": "ok", "message": "No active task running"}
 
 # =====================================================
-# 3. 角色卡管理 API
+# 3. Role Card Management API
 # =====================================================
 
 @app.get("/api/roles")
@@ -422,7 +423,7 @@ async def set_active_role_api(req: Request):
     return {"status": "ok", **role_manager.get_roles_payload()}
 
 # =====================================================
-# 4. 一次性安全链接 API 与分享页面
+# 4. One-Time Secure Links & Share Page
 # =====================================================
 
 @app.post("/api/links/create")
@@ -451,7 +452,7 @@ async def view_shared_conversation(token: str):
         <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>链接已失效</title>
+            <title>Link Expired</title>
             <style>
                 body {{ background: #0c0d14; color: #f8fafc; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }}
                 .card {{ background: rgba(26, 23, 40, 0.85); border: 1px solid rgba(244, 63, 94, 0.3); border-radius: 20px; padding: 36px; max-width: 400px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.6); backdrop-filter: blur(16px); }}
@@ -462,7 +463,7 @@ async def view_shared_conversation(token: str):
         <body>
             <div class="card">
                 <div style="font-size: 48px; margin-bottom: 12px;">🌸</div>
-                <h2>该阅后即焚链接已安全销毁</h2>
+                <h2>This Burn-After-Reading Link Has Been Destroyed</h2>
                 <p>{reason}</p>
             </div>
         </body>
@@ -475,9 +476,9 @@ async def view_shared_conversation(token: str):
 
     msg_html_list = []
     for m in messages:
-        role_label = "👤 用户" if m["role"] == "user" else "🤖 助手回复"
+        role_label = "👤 User" if m["role"] == "user" else "🤖 Assistant"
         box_class = "user-msg" if m["role"] == "user" else "ai-msg"
-        think_html = f'<details class="think-box"><summary>💭 思考过程</summary><pre>{m["thinking"]}</pre></details>' if m.get("thinking") else ""
+        think_html = f'<details class="think-box"><summary>💭 Thinking Process</summary><pre>{m["thinking"]}</pre></details>' if m.get("thinking") else ""
         content_html = f'<div class="msg-content">{m["content"]}</div>'
         msg_html_list.append(f"""
         <div class="msg-bubble {box_class}">
@@ -487,7 +488,7 @@ async def view_shared_conversation(token: str):
         </div>
         """)
 
-    msgs_body = "".join(msg_html_list) if msg_html_list else "<p style='color:#94a3b8; text-align:center;'>暂无记录</p>"
+    msgs_body = "".join(msg_html_list) if msg_html_list else "<p style='color:#94a3b8; text-align:center;'>No messages found</p>"
 
     return HTMLResponse(content=f"""
     <!DOCTYPE html>
@@ -495,7 +496,7 @@ async def view_shared_conversation(token: str):
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>{conv.get('title', '长文分享') if conv else '长文分享'}</title>
+        <title>{conv.get('title', 'Shared Chat') if conv else 'Shared Chat'}</title>
         <style>
             body {{ background: #0c0d14; color: #fdf2f8; font-family: -apple-system, sans-serif; margin: 0; padding: 16px; display: flex; justify-content: center; }}
             .container {{ width: 100%; max-width: 740px; }}
@@ -513,9 +514,9 @@ async def view_shared_conversation(token: str):
     <body>
         <div class="container">
             <div class="header">
-                <span class="badge">✨ 阅后即焚私密长文</span>
-                <h2 style="margin: 0 0 6px 0; font-size: 18px; color:#fdf2f8;">{conv.get('title', '对话长文') if conv else '对话长文'}</h2>
-                <div style="font-size: 12px; color: #a1a1aa;">本对话已在本地服务器阅后销毁，刷新页面即无法再次访问。</div>
+                <span class="badge">✨ Burn-After-Reading Private Share</span>
+                <h2 style="margin: 0 0 6px 0; font-size: 18px; color:#fdf2f8;">{conv.get('title', 'Shared Conversation') if conv else 'Shared Conversation'}</h2>
+                <div style="font-size: 12px; color: #a1a1aa;">This link has been destroyed on the local server; refreshing will no longer show this page.</div>
             </div>
             {msgs_body}
         </div>
@@ -524,7 +525,7 @@ async def view_shared_conversation(token: str):
     """)
 
 # =====================================================
-# 5. Web 界面与移动端自适应交互
+# 5. Web UI & Responsive Mobile Client
 # =====================================================
 
 @app.get("/")
@@ -539,11 +540,11 @@ async def serve_root_index(request: Request):
 async def mobile_web_index():
     return HTMLResponse(content="""
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>本地大模型 · 移动端交互工作站</title>
+    <title>Local LLM · Mobile Workstation</title>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -559,7 +560,7 @@ async def mobile_web_index():
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
         body { background: var(--bg-color); color: var(--text-main); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
         
-        /* 顶部导航 */
+        /* Top navigation */
         header { background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; z-index: 10; }
         .brand { font-size: 17px; font-weight: bold; color: var(--text-main); display: flex; align-items: center; gap: 6px; }
         .brand span { color: #a855f7; }
@@ -567,7 +568,7 @@ async def mobile_web_index():
         .role-pill { background: #4c1d95; color: #e9d5ff; font-size: 12px; font-weight: bold; padding: 5px 12px; border-radius: 14px; border: 1px solid #7c3aed; cursor: pointer; }
         .btn-icon { background: #334155; color: #cbd5e1; border: none; padding: 6px 10px; border-radius: 8px; font-size: 13px; cursor: pointer; font-weight: 500; }
         
-        /* 会话抽屉 (移动端侧滑) */
+        /* Conversation drawer (mobile slide-out) */
         .drawer-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 90; display: none; opacity: 0; transition: opacity 0.25s ease; }
         .drawer { position: fixed; top: 0; bottom: 0; left: 0; width: 280px; background: var(--card-bg); border-right: 1px solid var(--border); z-index: 100; transform: translateX(-100%); transition: transform 0.25s ease; display: flex; flex-direction: column; }
         .drawer.open { transform: translateX(0); }
@@ -577,7 +578,7 @@ async def mobile_web_index():
         .conv-item { padding: 12px; border-radius: 8px; margin-bottom: 6px; background: #0f172a; border: 1px solid transparent; font-size: 14px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
         .conv-item.active { border-color: var(--accent); background: #2e1065; color: #f5f3ff; font-weight: bold; }
         
-        /* 聊天主视窗 */
+        /* Main chat viewport */
         #chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
         .bubble-row { display: flex; flex-direction: column; max-width: 88%; }
         .bubble-row.user { align-self: flex-end; align-items: flex-end; }
@@ -593,7 +594,7 @@ async def mobile_web_index():
         .thinking-card summary { cursor: pointer; font-weight: bold; outline: none; }
         .thinking-card pre { margin-top: 6px; white-space: pre-wrap; color: #cbd5e1; font-family: inherit; font-size: 11.5px; }
 
-        /* 底部输入框控制舱 */
+        /* Bottom composer bar */
         footer { background: var(--card-bg); border-top: 1px solid var(--border); padding: 10px 14px; display: flex; gap: 8px; align-items: flex-end; }
         #chat-input { flex: 1; background: #0f172a; color: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; font-size: 14.5px; resize: none; max-height: 100px; min-height: 42px; outline: none; font-family: inherit; }
         #chat-input:focus { border-color: var(--accent); }
@@ -601,7 +602,7 @@ async def mobile_web_index():
         #btn-send:active { background: var(--accent-hover); }
         #btn-send.stop-btn { background: #e11d48; }
 
-        /* 移动端角色选择与编辑弹窗 */
+        /* Mobile role selector and editor sheet */
         .m-role-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.68); z-index: 120; display: none; align-items: flex-end; justify-content: center; }
         .m-role-overlay.open { display: flex; }
         .m-role-sheet { width: 100%; max-width: 520px; max-height: 82vh; background: var(--card-bg); border-top-left-radius: 18px; border-top-right-radius: 18px; border: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
@@ -621,8 +622,8 @@ async def mobile_web_index():
     <div id="drawer-overlay" class="drawer-overlay" onclick="toggleDrawer(false)"></div>
     <div id="drawer" class="drawer">
         <div class="drawer-header">
-            <span>会话列表</span>
-            <button class="btn-icon" onclick="createNewSession()">+ 新对话</button>
+            <span>Conversations</span>
+            <button class="btn-icon" onclick="createNewSession()">+ New Chat</button>
         </div>
         <div id="drawer-conv-list" class="drawer-list"></div>
     </div>
@@ -630,19 +631,19 @@ async def mobile_web_index():
     <div id="m-role-overlay" class="m-role-overlay" onclick="if(event.target===this) closeMobileRoleSheet()">
         <div class="m-role-sheet">
             <div class="m-role-head">
-                <span id="m-role-title">🎭 角色设定切换与编辑</span>
+                <span id="m-role-title">🎭 Role Presets &amp; Editor</span>
                 <div style="display:flex;gap:6px;">
-                    <button id="m-role-add-btn" class="btn-icon" style="background:#7c3aed;color:#fff;" onclick="openMobileRoleEditor(null)">+ 新建</button>
+                    <button id="m-role-add-btn" class="btn-icon" style="background:#7c3aed;color:#fff;" onclick="openMobileRoleEditor(null)">+ New</button>
                     <button class="btn-icon" onclick="closeMobileRoleSheet()">✕</button>
                 </div>
             </div>
             <div id="m-role-list" class="m-role-body"></div>
             <div id="m-role-form" class="m-role-form">
-                <input id="m-role-name" type="text" placeholder="角色名称" />
-                <textarea id="m-role-prompt" placeholder="系统提示词 (支持多行)..."></textarea>
+                <input id="m-role-name" type="text" placeholder="Role name" />
+                <textarea id="m-role-prompt" placeholder="System prompt (multiline supported)..."></textarea>
                 <div style="display:flex;justify-content:flex-end;gap:8px;">
-                    <button class="btn-icon" onclick="showMobileRoleList()">取消</button>
-                    <button class="btn-icon" style="background:#7c3aed;color:#fff;" onclick="saveMobileRole()">保存并应用</button>
+                    <button class="btn-icon" onclick="showMobileRoleList()">Cancel</button>
+                    <button class="btn-icon" style="background:#7c3aed;color:#fff;" onclick="saveMobileRole()">Save &amp; Apply</button>
                 </div>
             </div>
         </div>
@@ -651,25 +652,25 @@ async def mobile_web_index():
     <header>
         <div class="brand">
             <button class="btn-icon" onclick="toggleDrawer(true)" style="margin-right: 4px;">☰</button>
-            <span>✦ 本地 AI</span>
+            <span>✦ Local AI</span>
         </div>
         <div class="top-actions">
-            <div id="role-badge" class="role-pill" onclick="openMobileRoleSheet()">🎭 加载中</div>
-            <button class="btn-icon" onclick="exportCurrentChat()">📥 导出</button>
+            <div id="role-badge" class="role-pill" onclick="openMobileRoleSheet()">🎭 Loading</div>
+            <button class="btn-icon" onclick="exportCurrentChat()">📥 Export</button>
         </div>
     </header>
 
     <div id="chat-messages"></div>
 
     <footer>
-        <textarea id="chat-input" placeholder="输入消息开始对话 (Enter 发送)..." rows="1" onkeydown="handleInputKey(event)"></textarea>
+        <textarea id="chat-input" placeholder="Type a message (Enter to send)..." rows="1" onkeydown="handleInputKey(event)"></textarea>
         <button id="btn-send" onclick="handleSendOrStop()">➔</button>
     </footer>
 
     <script>
         let currentConvId = null;
         let currentRoleName = "__NONE__";
-        let currentRoleDisplay = "原生默认";
+        let currentRoleDisplay = "Native Default";
         let isGenerating = false;
         let activeRoles = [];
         let activeMode = "preset";
@@ -684,9 +685,9 @@ async def mobile_web_index():
         function updateMobileRoleBadge() {
             const badge = document.getElementById("role-badge");
             if (activeMode === "none" || currentRoleName === "__NONE__") {
-                badge.innerText = "⚪ 原生默认";
+                badge.innerText = "⚪ Native Default";
             } else if (activeMode === "temp" || currentRoleName === "__TEMP__") {
-                badge.innerText = "⚡ 临时角色";
+                badge.innerText = "⚡ Temp Role";
             } else {
                 const shortName = currentRoleDisplay.length > 7 ? currentRoleDisplay.slice(0, 6) + ".." : currentRoleDisplay;
                 badge.innerText = "🎭 " + shortName;
@@ -718,17 +719,17 @@ async def mobile_web_index():
 
         function showMobileRoleList() {
             editingMobileRoleId = null;
-            document.getElementById("m-role-title").innerText = "🎭 角色设定切换与编辑";
+            document.getElementById("m-role-title").innerText = "🎭 Role Presets & Editor";
             document.getElementById("m-role-add-btn").style.display = "inline-block";
             document.getElementById("m-role-form").classList.remove("open");
             const listEl = document.getElementById("m-role-list");
             listEl.style.display = "flex";
             listEl.innerHTML = "";
 
-            // 原生默认
+            // Native Default
             const noneCard = document.createElement("div");
             noneCard.className = "m-role-card" + (activeMode === "none" ? " active" : "");
-            noneCard.innerHTML = '<div class="m-role-top"><span>⚪ 原生默认（不注入角色）</span></div><div class="m-role-preview">使用模型原始能力直接回复</div>';
+            noneCard.innerHTML = '<div class="m-role-top"><span>⚪ Native Default (No Role)</span></div><div class="m-role-preview">Reply directly using the model\\'s built-in behavior</div>';
             noneCard.onclick = async () => {
                 await fetch("/api/roles/active", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({mode:"none"}) });
                 await loadRoles();
@@ -739,7 +740,7 @@ async def mobile_web_index():
             if (tempPrompt) {
                 const tCard = document.createElement("div");
                 tCard.className = "m-role-card" + (activeMode === "temp" ? " active" : "");
-                tCard.innerHTML = '<div class="m-role-top"><span>⚡ 临时自定义角色</span></div>';
+                tCard.innerHTML = '<div class="m-role-top"><span>⚡ Temporary Custom Role</span></div>';
                 const p = document.createElement("div"); p.className = "m-role-preview"; p.innerText = tempPrompt;
                 tCard.appendChild(p);
                 tCard.onclick = async () => {
@@ -767,7 +768,7 @@ async def mobile_web_index():
                 db.className = "btn-icon"; db.innerText = "🗑️";
                 db.onclick = async (e) => {
                     e.stopPropagation();
-                    if (!confirm("确认删除角色「" + r.name + "」？")) return;
+                    if (!confirm('Delete role "' + r.name + '"?')) return;
                     await fetch("/api/roles/" + r.id, { method: "DELETE" });
                     await loadRoles();
                     showMobileRoleList();
@@ -789,7 +790,7 @@ async def mobile_web_index():
 
         function openMobileRoleEditor(roleOrNull) {
             editingMobileRoleId = roleOrNull ? roleOrNull.id : null;
-            document.getElementById("m-role-title").innerText = roleOrNull ? "✏️ 编辑角色" : "➕ 新建角色";
+            document.getElementById("m-role-title").innerText = roleOrNull ? "✏️ Edit Role" : "➕ New Role";
             document.getElementById("m-role-add-btn").style.display = "none";
             document.getElementById("m-role-list").style.display = "none";
             document.getElementById("m-role-form").classList.add("open");
@@ -800,7 +801,7 @@ async def mobile_web_index():
         async function saveMobileRole() {
             const name = document.getElementById("m-role-name").value.trim();
             const prompt = document.getElementById("m-role-prompt").value.trim();
-            if (!name || !prompt) { alert("请填写完整角色名称和提示词"); return; }
+            if (!name || !prompt) { alert("Please fill in both role name and prompt."); return; }
             const url = editingMobileRoleId ? ("/api/roles/" + editingMobileRoleId) : "/api/roles";
             const method = editingMobileRoleId ? "PUT" : "POST";
             const res = await fetch(url, {
@@ -810,7 +811,7 @@ async def mobile_web_index():
             });
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
-                alert(err.detail || "保存失败");
+                alert(err.detail || "Save failed");
                 return;
             }
             await loadRoles();
@@ -856,7 +857,7 @@ async def mobile_web_index():
                 const res = await fetch("/api/conversations", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ title: "新对话", role_name: currentRoleName })
+                    body: JSON.stringify({ title: "New Chat", role_name: currentRoleName })
                 });
                 const data = await res.json();
                 currentConvId = data.conv_id;
@@ -884,7 +885,7 @@ async def mobile_web_index():
 
             const header = document.createElement("div");
             header.className = "bubble-header";
-            header.innerText = isUser ? "👤 我" : "✦ " + currentRoleDisplay;
+            header.innerText = isUser ? "👤 Me" : "✦ " + currentRoleDisplay;
             row.appendChild(header);
 
             const bubble = document.createElement("div");
@@ -893,7 +894,7 @@ async def mobile_web_index():
             if (thinking && !isUser) {
                 const thinkCard = document.createElement("details");
                 thinkCard.className = "thinking-card";
-                thinkCard.innerHTML = "<summary>💭 思考过程</summary><pre>" + thinking + "</pre>";
+                thinkCard.innerHTML = "<summary>💭 Thinking Process</summary><pre>" + thinking + "</pre>";
                 bubble.appendChild(thinkCard);
             }
 
@@ -979,7 +980,7 @@ async def mobile_web_index():
                     }
                 }
             } catch(e) {
-                liveDiv.innerText = "[连接中断或已完成]";
+                liveDiv.innerText = "[Connection interrupted or completed]";
             } finally {
                 isGenerating = false;
                 btn.innerText = "➔";
@@ -999,7 +1000,7 @@ async def mobile_web_index():
 """)
 
 # =====================================================
-# 6. 官方 Web UI 静态资源与底层引擎全量反向代理
+# 6. Static Web UI Assets & Engine Reverse Proxy
 # =====================================================
 
 @app.get("/api/health")
@@ -1011,7 +1012,7 @@ async def system_status():
     from model_manager import get_system_vram_info, get_system_ram_info
     gpu_name, vram_total, vram_used, vram_free = get_system_vram_info()
     ram_total, ram_used, ram_avail = get_system_ram_info()
-    
+
     backend_status = "offline"
     try:
         timeout = aiohttp.ClientTimeout(total=1.0)
@@ -1040,10 +1041,10 @@ async def system_status():
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def catch_all_proxy(request: Request, full_path: str):
     """
-    通用反向代理：
-    1. 优先返回 web/ 目录下的原生静态资源。
-    2. 对 /props, /models, /slots, /completion, /v1/chat/completions 等，透明转发至后端 llama-server (8081)。
-    3. 对流式响应 (SSE / chunked)，实时透传给前端。
+    General reverse proxy:
+    1. Serve static files from web/ if they exist.
+    2. Forward /props, /models, /slots, /completion, /v1/chat/completions, etc. to llama-server (8081).
+    3. Stream SSE/chunked responses transparently back to the client.
     """
     if request.method == "GET":
         local_file = os.path.join(WEB_DIR, full_path)
@@ -1062,7 +1063,7 @@ async def catch_all_proxy(request: Request, full_path: str):
 
     body = await request.body()
 
-    # 针对 /chat/completions 与 /v1/chat/completions 做统一的角色系统提示词适配（兼容非 Qwen 原生模板与原生默认模式）
+    # Unified system prompt adaptation for /chat/completions and /v1/chat/completions
     if request.method == "POST" and body and full_path.rstrip("/").endswith("chat/completions"):
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -1080,7 +1081,7 @@ async def catch_all_proxy(request: Request, full_path: str):
                             msgs.pop(0)
                     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 elif role_mode_hdr is None:
-                    # 第三方 OpenAI 客户端直接请求且未传 system 消息时，按当前激活角色兜底注入
+                    # Fallback injection for direct OpenAI API clients without an explicit system message
                     has_sys = any(m.get("role") == "system" for m in msgs)
                     if not has_sys:
                         m_mode, _, m_prompt = role_manager.get_active_prompt_info()
