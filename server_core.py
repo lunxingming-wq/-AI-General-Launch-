@@ -17,7 +17,8 @@ import asyncio
 import aiohttp
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException, Response
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, RedirectResponse
+import hmac
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -45,6 +46,85 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+TOKEN_FILE_PATH = os.path.join(TARGET_DIR, ".access_token")
+
+
+def _get_active_access_token() -> str:
+    env_tok = (os.environ.get("WEB_ACCESS_TOKEN") or "").strip()
+    if env_tok:
+        return env_tok
+    if os.path.exists(TOKEN_FILE_PATH):
+        try:
+            with open(TOKEN_FILE_PATH, "r", encoding="utf-8") as fp:
+                return fp.read().strip()
+        except Exception:
+            return ""
+    return ""
+
+
+@app.middleware("http")
+async def optional_access_token_middleware(request: Request, call_next):
+    expected = _get_active_access_token()
+    if not expected:
+        return await call_next(request)
+
+    path = request.url.path
+    if request.method == "OPTIONS" or path == "/api/health" or path.startswith("/share/"):
+        return await call_next(request)
+
+    client_host = request.client.host if request.client else ""
+    is_proxied = bool(request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for"))
+    if (
+        not is_proxied
+        and client_host in ("127.0.0.1", "::1", "localhost")
+        and os.environ.get("WEB_AUTH_LOCAL") != "1"
+    ):
+        return await call_next(request)
+
+    auth_hdr = request.headers.get("authorization", "")
+    bearer = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+    api_key = request.headers.get("x-api-key", "").strip()
+    cookie_tok = request.cookies.get("qidong_token", "").strip()
+    query_tok = request.query_params.get("token", "").strip()
+
+    def _matches(val: str) -> bool:
+        return bool(val) and hmac.compare_digest(val, expected)
+
+    if _matches(bearer) or _matches(api_key) or _matches(cookie_tok):
+        return await call_next(request)
+
+    if _matches(query_tok):
+        if request.method == "GET" and path in ("/", "/mobile", "/m"):
+            resp = RedirectResponse(url=path, status_code=302)
+            resp.set_cookie("qidong_token", expected, httponly=True, samesite="lax", max_age=86400 * 7)
+            return resp
+        resp = await call_next(request)
+        resp.set_cookie("qidong_token", expected, httponly=True, samesite="lax", max_age=86400 * 7)
+        return resp
+
+    if request.method == "GET" and path in ("/", "/mobile", "/m"):
+        return HTMLResponse(
+            content="""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access Token Required</title>
+<style>
+body{background:#0f172a;color:#f8fafc;font-family:-apple-system,Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.box{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:28px;max-width:380px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+h2{margin:0 0 8px;font-size:18px}p{margin:0 0 18px;font-size:13px;color:#94a3b8;line-height:1.5}
+input{width:100%;box-sizing:border-box;background:#0f172a;color:#fff;border:1px solid #475569;border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:12px;outline:none}
+button{width:100%;background:#7c3aed;color:#fff;border:none;border-radius:10px;padding:10px;font-size:14px;font-weight:600;cursor:pointer}
+</style></head><body>
+<form class="box" method="GET">
+<h2>🔒 Remote Access Protected</h2>
+<p>Enter the access token configured on the host PC to unlock the Web UI.</p>
+<input name="token" type="password" placeholder="Access Token" required autofocus />
+<button type="submit">Unlock</button>
+</form></body></html>""",
+            status_code=401,
+        )
+
+    return JSONResponse({"detail": "Unauthorized: valid access token required"}, status_code=401)
 
 if os.path.exists(os.path.join(WEB_DIR, "_app")):
     app.mount("/_app", StaticFiles(directory=os.path.join(WEB_DIR, "_app")), name="_app")

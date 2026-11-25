@@ -92,14 +92,92 @@ def get_system_ram_gb():
     return total_ram
 
 
+VIRTUAL_GPU_KEYWORDS = (
+    "microsoft basic", "remote", "virtual", "vmware", "hyper-v",
+    "parsec", "oray", "sunlogin", "spacedesk", "gameviewer", "idd",
+)
+SPLIT_GGUF_RE = re.compile(r"^(?P<base>.+)-(?P<part>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
+VISION_MODEL_HINTS = (
+    "vl", "vision", "llava", "pixtral", "minicpm-v", "minicpmv", "internvl",
+    "gemma-3", "gemma3", "molmo", "idefics", "smolvlm", "glm-4v", "cogvlm",
+    "janus", "ovis", "omni", "multimodal",
+)
+GENERIC_NAME_TOKENS = {
+    "gguf", "mmproj", "f16", "fp16", "bf16", "f32", "q2", "q3", "q4", "q5",
+    "q6", "q8", "k", "m", "s", "l", "xs", "xxs", "iq1", "iq2", "iq3", "iq4",
+    "instruct", "chat", "it", "base", "model", "v1", "v2", "00001", "of",
+}
+
+
+def _detect_windows_gpu_vram():
+    """Detect real AMD/Intel GPU VRAM via Windows Display Adapter registry; returns 0 GB for CPU-only."""
+    try:
+        import winreg
+    except Exception:
+        return "CPU Only", 0.0, 0.0, 0.0
+
+    base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    best_name, best_gb = None, 0.0
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+            idx = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, idx)
+                    idx += 1
+                except OSError:
+                    break
+                if not sub.isdigit():
+                    continue
+                try:
+                    with winreg.OpenKey(root, sub) as sk:
+                        desc = ""
+                        try:
+                            desc, _ = winreg.QueryValueEx(sk, "DriverDesc")
+                        except OSError:
+                            pass
+                        desc_s = str(desc or "").strip()
+                        if any(k in desc_s.lower() for k in VIRTUAL_GPU_KEYWORDS):
+                            continue
+                        mem_bytes = 0
+                        for kname in ("HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"):
+                            try:
+                                val, _ = winreg.QueryValueEx(sk, kname)
+                                if isinstance(val, bytes):
+                                    val = int.from_bytes(val, "little", signed=False)
+                                elif isinstance(val, int) and val < 0:
+                                    val = val & 0xFFFFFFFF
+                                if val and val > 0:
+                                    mem_bytes = int(val)
+                                    break
+                            except OSError:
+                                pass
+                        gb = round(mem_bytes / (1024**3), 1)
+                        if gb > best_gb:
+                            best_gb = gb
+                            best_name = desc_s or "GPU"
+                except OSError:
+                    continue
+    except Exception:
+        pass
+
+    if best_name and best_gb >= 1.0:
+        used_gb = round(min(1.2, best_gb * 0.15), 1)
+        free_gb = round(max(0.5, best_gb - used_gb), 1)
+        return best_name, best_gb, used_gb, free_gb
+    return "CPU Only (No Dedicated GPU)", 0.0, 0.0, 0.0
+
+
 def get_system_vram_info():
-    """Return NVIDIA GPU name, total VRAM, used VRAM, free VRAM (GB)."""
+    """Return GPU name, total VRAM, used VRAM, free VRAM (GB) for NVIDIA/AMD/Intel/CPU."""
     import subprocess
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"],
             encoding="utf-8",
             errors="ignore",
+            timeout=2,
+            creationflags=0x08000000 if sys.platform == "win32" else 0,
         )
         line = out.strip().split("\n")[0]
         parts = [x.strip() for x in line.split(",")]
@@ -109,7 +187,93 @@ def get_system_vram_info():
         free_gb = round(int(parts[3]) / 1024.0, 1)
         return gpu_name, total_gb, used_gb, free_gb
     except Exception:
-        return "GPU / CPU", 12.0, 1.8, 10.2
+        return _detect_windows_gpu_vram()
+
+
+def get_gguf_total_size_info(filepath):
+    """Return (total_bytes, found_parts, expected_parts, is_split, is_complete) for single or split GGUFs."""
+    fname = os.path.basename(filepath)
+    parent = os.path.dirname(os.path.abspath(filepath))
+    m = SPLIT_GGUF_RE.match(fname)
+    if not m:
+        try:
+            return os.path.getsize(filepath), 1, 1, False, True
+        except Exception:
+            return 0, 1, 1, False, False
+
+    base = m.group("base").lower()
+    expected = int(m.group("total"))
+    total_bytes = 0
+    found = 0
+    try:
+        for entry in os.scandir(parent):
+            if not entry.is_file():
+                continue
+            om = SPLIT_GGUF_RE.match(entry.name)
+            if om and om.group("base").lower() == base and int(om.group("total")) == expected:
+                found += 1
+                total_bytes += entry.stat().st_size
+    except Exception:
+        try:
+            total_bytes = os.path.getsize(filepath)
+            found = 1
+        except Exception:
+            pass
+    return total_bytes, found, expected, True, (found >= expected)
+
+
+def _tokenize_model_name(name):
+    stem = os.path.splitext(os.path.basename(name))[0].lower()
+    stem = re.sub(r"-\d{5}-of-\d{5}$", "", stem)
+    raw = re.split(r"[^a-z0-9.]+", stem)
+    return {t for t in raw if len(t) >= 2 and t not in GENERIC_NAME_TOKENS}
+
+
+def find_matching_mmproj(filepath):
+    """Find best matching *mmproj*.gguf for a model without falsely pairing text-only models."""
+    model_abs = os.path.abspath(filepath)
+    model_dir = os.path.dirname(model_abs)
+    model_name = os.path.basename(model_abs).lower()
+    model_tokens = _tokenize_model_name(model_name)
+    is_vision_model = any(h in model_name for h in VISION_MODEL_HINTS)
+
+    candidates = []
+    seen = set()
+    for search_dir, same_dir in ((model_dir, True), (MODELS_DIR, False)):
+        if not search_dir or not os.path.isdir(search_dir):
+            continue
+        try:
+            for entry in os.scandir(search_dir):
+                if entry.is_file() and entry.name.lower().endswith(".gguf") and "mmproj" in entry.name.lower():
+                    p = os.path.abspath(entry.path)
+                    k = os.path.normcase(p)
+                    if k not in seen:
+                        seen.add(k)
+                        candidates.append((p, entry.name, same_dir))
+        except Exception:
+            continue
+
+    if not candidates:
+        return ""
+
+    best_path = ""
+    best_score = 0
+    for cand_path, cand_name, same_dir in candidates:
+        cand_tokens = _tokenize_model_name(cand_name)
+        overlap = model_tokens & cand_tokens
+        score = len(overlap) * 10 + (3 if same_dir else 0)
+        # Require strong token overlap (or >=1 shared family token for explicit vision models)
+        if len(overlap) >= 2 or (is_vision_model and len(overlap) >= 1):
+            if score > best_score:
+                best_score = score
+                best_path = cand_path
+        elif is_vision_model and same_dir and len(candidates) == 1 and not cand_tokens:
+            # Generic `mmproj-model-f16.gguf` sitting alone next to an explicit VL/vision model
+            if 2 > best_score:
+                best_score = 2
+                best_path = cand_path
+
+    return best_path
 
 
 def get_system_vram_gb():
@@ -259,6 +423,9 @@ def scan_models():
             for entry in os.scandir(dir_path):
                 if not (entry.is_file() and entry.name.lower().endswith(".gguf") and "mmproj" not in entry.name.lower()):
                     continue
+                split_m = SPLIT_GGUF_RE.match(entry.name)
+                if split_m and int(split_m.group("part")) > 1:
+                    continue
                 full_path = os.path.abspath(entry.path)
                 norm_full = os.path.normcase(full_path)
                 if norm_full in seen_paths:
@@ -266,7 +433,8 @@ def scan_models():
                 seen_paths.add(norm_full)
 
                 stat = entry.stat()
-                size_gb = round(stat.st_size / (1024**3), 2)
+                total_bytes, found_parts, expected_parts, is_split, is_complete = get_gguf_total_size_info(full_path)
+                size_gb = round(total_bytes / (1024**3), 2)
                 mtime = stat.st_mtime
 
                 cached = cache.get(full_path) or cache.get(entry.name)
@@ -279,16 +447,19 @@ def scan_models():
                     cache_dirty = True
 
                 is_unsupported = arch in NON_LLM_ARCHS
-                is_oversized = size_gb > 10.0
+                is_oversized = (total_vram > 0.5) and (size_gb > max(2.0, total_vram - 1.5))
 
-                if blocks > 0:
+                if total_vram <= 0.5:
+                    high_ngl = 0
+                    low_ngl = 0
+                elif blocks > 0:
                     gb_per_layer = max(0.05, size_gb / blocks)
                     if is_oversized:
-                        high_ngl = min(blocks - 2, max(4, int((total_vram - 2.0) / gb_per_layer)))
-                        low_ngl = min(high_ngl - 2, max(2, int((6.0 - 1.5) / gb_per_layer)))
+                        high_ngl = min(blocks - 2, max(1, int(max(0.5, total_vram - 2.0) / gb_per_layer)))
+                        low_ngl = min(max(1, high_ngl - 2), max(1, int(max(0.5, min(6.0, total_vram * 0.6) - 1.0) / gb_per_layer)))
                     else:
                         high_ngl = blocks
-                        low_ngl = min(blocks - 2, max(4, int((8.0 - 1.5) / gb_per_layer)))
+                        low_ngl = min(blocks - 2, max(1, int(max(0.5, min(8.0, total_vram * 0.75) - 1.2) / gb_per_layer)))
                 else:
                     high_ngl = 28
                     low_ngl = 12
@@ -305,7 +476,10 @@ def scan_models():
                 elif raw_tokens >= 16384: pure_ram_ctx, pure_ram_ctx_label = 16384, "16K"
                 else: pure_ram_ctx, pure_ram_ctx_label = 8192, "8K"
 
-                display_title = f"{tag} {entry.name}"
+                split_tag = ""
+                if is_split:
+                    split_tag = f" [{expected_parts}-Part Split]" if is_complete else f" [INCOMPLETE Split {found_parts}/{expected_parts}]"
+                display_title = f"{tag} {entry.name}{split_tag}"
 
                 models.append({
                     "filename": entry.name,
@@ -359,8 +533,8 @@ def calc_strategy(filepath, choice, is_oversized, target_vram=None, opt_choice="
     gpu_name, total_vram, used_vram, free_vram = get_system_vram_info()
 
     try:
-        stat = os.stat(filepath)
-        size_gb = round(stat.st_size / (1024**3), 2)
+        total_bytes, _, _, _, _ = get_gguf_total_size_info(filepath)
+        size_gb = round(total_bytes / (1024**3), 2) if total_bytes > 0 else 5.0
     except Exception as e:
         print(f"[WARNING] calc_strategy: cannot read model size ({filepath}): {e}", file=sys.stderr)
         size_gb = 5.0
@@ -374,21 +548,40 @@ def calc_strategy(filepath, choice, is_oversized, target_vram=None, opt_choice="
 
     # Dynamically budget VRAM & RAM based on the selected optimization tier
     if opt == "1":
-        gpu_total_budget = round(min(total_vram - 0.8, max(3.5, free_vram + 0.6)), 1)
+        gpu_total_budget = round(max(0.5, min(total_vram - 0.8, free_vram + 0.6)), 1) if total_vram > 0.5 else 0.0
         avail_ram_budget = round(min(total_ram - 2.5, max(4.0, avail_ram)), 1)
         opt_label = "Fast Cleanup"
     elif opt == "2":
-        gpu_total_budget = round(min(total_vram - 0.6, max(3.5, free_vram + 1.0)), 1)
+        gpu_total_budget = round(max(0.5, min(total_vram - 0.6, free_vram + 1.0)), 1) if total_vram > 0.5 else 0.0
         avail_ram_budget = round(min(total_ram - 2.0, max(4.0, avail_ram + 1.5)), 1)
         opt_label = "Extreme Cleanup"
     elif opt == "3":
-        gpu_total_budget = round(max(3.5, total_vram - 1.6), 1)
+        gpu_total_budget = round(max(0.5, total_vram - 1.6), 1) if total_vram > 0.5 else 0.0
         avail_ram_budget = round(min(total_ram - 3.0, max(4.0, avail_ram)), 1)
         opt_label = "RAM Trim Only"
     else:  # opt == "4"
-        gpu_total_budget = round(max(3.5, total_vram - max(1.8, used_vram)), 1)
+        gpu_total_budget = round(max(0.5, total_vram - max(1.5, used_vram)), 1) if total_vram > 0.5 else 0.0
         avail_ram_budget = round(max(3.0, avail_ram - 3.0), 1)
         opt_label = "As-Is (Unoptimized)"
+
+    # Force safe CPU/RAM strategy whenever no dedicated GPU VRAM is detected
+    if total_vram <= 0.5:
+        ngl = 0
+        applied_vram = 0.0
+        model_vram_est = 0.0
+        remain_layers = blocks
+        avail_kv_gb = max(1.0, avail_ram_budget - size_gb)
+        gb_per_token = (max(20, blocks) * 8704) / (1024**3)
+        raw_tokens = int(avail_kv_gb / gb_per_token)
+        if raw_tokens >= 65536: ctx = 65536
+        elif raw_tokens >= 32768: ctx = 32768
+        elif raw_tokens >= 16384: ctx = 16384
+        else: ctx = max(4096, (raw_tokens // 2048) * 2048)
+        flags = "-ctk q8_0 -ctv q8_0"
+        mode = f"CPU-Only Pure RAM Mode ({ctx} ctx - No Dedicated GPU - {opt_label})"
+        res = f"{ngl}:{ctx}:{mode}:{flags}:{remain_layers}:{model_vram_est:.1f}:{applied_vram:.1f}:{blocks}\n"
+        _bat_write(res)
+        return
 
     if str(choice) == "1":  # Full VRAM / Max GPU Acceleration
         if str(is_oversized) != "1" and size_gb <= gpu_total_budget - 1.2:
@@ -458,10 +651,10 @@ def calc_strategy(filepath, choice, is_oversized, target_vram=None, opt_choice="
             mode = f"VRAM Model + RAM Context ({ctx} ctx - {ngl}/{blocks} GPU - KV in RAM - {opt_label})"
 
     elif str(choice) == "3":  # Balanced Coexistence
-        reserved_free = 4.0 if opt in ("1", "2") else 5.0
-        applied_vram = round(max(4.0, total_vram - reserved_free), 1)
-        target_weights_vram = max(1.0, applied_vram - 1.2)
-        ngl = min(blocks, max(4, int(target_weights_vram / gb_per_layer)))
+        reserved_free = min(4.0 if opt in ("1", "2") else 5.0, round(total_vram * 0.4, 1))
+        applied_vram = round(max(1.5, total_vram - reserved_free), 1)
+        target_weights_vram = max(0.8, applied_vram - 0.8)
+        ngl = min(blocks, max(1, int(target_weights_vram / gb_per_layer)))
         if str(is_oversized) != "1" and ngl >= blocks:
             ngl = 99
             model_vram_est = size_gb
@@ -584,8 +777,8 @@ def print_resource_banner(
 ):
     """Print detailed hardware/memory allocation summary and access endpoints."""
     try:
-        size_bytes = os.path.getsize(filepath)
-        size_gb = round(size_bytes / (1024**3), 2)
+        size_bytes, _, _, _, _ = get_gguf_total_size_info(filepath)
+        size_gb = round(size_bytes / (1024**3), 2) if size_bytes > 0 else 8.0
     except Exception:
         size_gb = 8.0
 
@@ -636,16 +829,16 @@ def print_resource_banner(
     model_vram_total = round(gpu_weights + (0.0 if nkvo else kv_gb) + cuda_scratch, 1)
     model_ram_total = round(cpu_weights + (kv_gb if nkvo else 0.0) + 0.3, 1)
 
-    vram_pct = min(100, int((model_vram_total / max(1.0, gpu_total)) * 100))
+    vram_pct = min(100, int((model_vram_total / gpu_total) * 100)) if gpu_total > 0.1 else 0
     ram_pct = min(100, int((model_ram_total / max(1.0, ram_total)) * 100))
 
     offload_pct = int((gpu_layers / max(1, total_blocks)) * 100)
 
     try:
         import network_helper
-        lan_ip, tailscale_ip = network_helper.get_network_ips()
+        ep = network_helper.get_all_network_endpoints()
     except Exception:
-        lan_ip, tailscale_ip = "127.0.0.1", None
+        ep = {"lan": "127.0.0.1", "tailscale": None, "easytier": None, "zerotier": None}
 
     kv_vram_desc = "0.00 GB (Offloaded to System RAM via -nkvo)" if nkvo else f"{kv_gb:.2f} GB (Resident in VRAM)"
     kv_ram_desc = f"{kv_gb:.2f} GB (Resident in System RAM)" if nkvo else "0.00 GB (Resident in GPU VRAM)"
@@ -675,11 +868,18 @@ def print_resource_banner(
         "----------------------------------------------------------------------",
         "[Service Endpoints (Web UI & OpenAI API)]",
         " * Local PC Web UI       : http://127.0.0.1:8080",
-        f" * LAN (Phone / Tablet)  : http://{lan_ip}:8080",
+        f" * LAN (Phone / Tablet)  : http://{ep['lan']}:8080",
     ]
-    if tailscale_ip:
-        lines.append(f" * Tailscale Remote      : http://{tailscale_ip}:8080")
+    if ep.get("tailscale"):
+        lines.append(f" * Tailscale Remote      : http://{ep['tailscale']}:8080")
+    if ep.get("easytier"):
+        lines.append(f" * EasyTier Remote       : http://{ep['easytier']}:8080")
+    if ep.get("zerotier"):
+        lines.append(f" * ZeroTier Remote       : http://{ep['zerotier']}:8080")
     lines.append(" * OpenAI-Compatible API : http://127.0.0.1:8080/v1")
+    token_active = bool((os.environ.get("WEB_ACCESS_TOKEN") or "").strip()) or os.path.exists(os.path.join(TARGET_DIR, ".access_token"))
+    if token_active:
+        lines.append(" * Remote Auth Protection: ENABLED (localhost stays password-free)")
     lines.append("======================================================================")
     lines.append("")
 
@@ -717,6 +917,13 @@ def main():
         print(read_gguf_blocks(sys.argv[2]))
     elif sys.argv[1] == "--check-template-compat" and len(sys.argv) >= 3:
         check_template_compat(sys.argv[2])
+    elif sys.argv[1] == "--find-mmproj" and len(sys.argv) >= 3:
+        mm = find_matching_mmproj(sys.argv[2])
+        if mm:
+            _bat_write(mm + "\n")
+    elif sys.argv[1] == "--vram-info":
+        gn, gt, gu, gf = get_system_vram_info()
+        _bat_write(f"{gn}|{gt:.1f}|{gu:.1f}|{gf:.1f}\n")
     elif sys.argv[1] == "--calc-strategy" and len(sys.argv) >= 5:
         target = sys.argv[5] if len(sys.argv) >= 6 else None
         opt = sys.argv[6] if len(sys.argv) >= 7 else "1"

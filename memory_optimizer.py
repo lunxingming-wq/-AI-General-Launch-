@@ -85,6 +85,64 @@ def get_ram_info():
     return total_gb, avail_gb, used_gb
 
 
+CLEANUP_APPS_FILE = os.path.join(TARGET_DIR, "cleanup_apps.txt")
+VIRTUAL_GPU_KEYWORDS = (
+    "microsoft basic", "remote", "virtual", "vmware", "hyper-v",
+    "parsec", "oray", "sunlogin", "spacedesk", "gameviewer", "idd",
+)
+
+
+def _detect_non_nvidia_vram():
+    """Read dedicated VRAM (GB) for AMD/Intel GPUs from Windows Display Adapter registry."""
+    base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    best_gb = 0.0
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+            idx = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, idx)
+                    idx += 1
+                except OSError:
+                    break
+                if not sub.isdigit():
+                    continue
+                try:
+                    with winreg.OpenKey(root, sub) as sk:
+                        desc = ""
+                        try:
+                            desc, _ = winreg.QueryValueEx(sk, "DriverDesc")
+                        except OSError:
+                            pass
+                        if any(k in str(desc).lower() for k in VIRTUAL_GPU_KEYWORDS):
+                            continue
+                        mem_bytes = 0
+                        for kname in ("HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"):
+                            try:
+                                val, _ = winreg.QueryValueEx(sk, kname)
+                                if isinstance(val, bytes):
+                                    val = int.from_bytes(val, "little", signed=False)
+                                elif isinstance(val, int) and val < 0:
+                                    val = val & 0xFFFFFFFF
+                                if val and val > 0:
+                                    mem_bytes = int(val)
+                                    break
+                            except OSError:
+                                pass
+                        gb = round(mem_bytes / (1024**3), 1)
+                        if gb > best_gb:
+                            best_gb = gb
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    if best_gb >= 1.0:
+        used_gb = round(min(1.2, best_gb * 0.15), 1)
+        free_gb = round(max(0.5, best_gb - used_gb), 1)
+        return best_gb, free_gb, used_gb
+    return 0.0, 0.0, 0.0
+
+
 def get_vram_info():
     try:
         out = subprocess.check_output(
@@ -92,14 +150,33 @@ def get_vram_info():
             encoding="utf-8",
             errors="ignore",
             timeout=2,
+            creationflags=0x08000000 if sys.platform == "win32" else 0,
         )
-        parts = [float(x.strip()) for x in out.strip().split(",")]
+        line = out.strip().splitlines()[0]
+        parts = [float(x.strip()) for x in line.split(",")]
         total_gb = round(parts[0] / 1024.0, 1)
         used_gb = round(parts[1] / 1024.0, 1)
         free_gb = round(parts[2] / 1024.0, 1)
         return total_gb, free_gb, used_gb
     except Exception:
-        return 12.0, 10.0, 2.0
+        return _detect_non_nvidia_vram()
+
+
+def load_cleanup_targets():
+    """Load background process names from cleanup_apps.txt (falls back to minimal safe default)."""
+    if os.path.exists(CLEANUP_APPS_FILE):
+        targets = []
+        try:
+            with open(CLEANUP_APPS_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    targets.append(line)
+            return targets
+        except Exception:
+            pass
+    return ["steamwebhelper.exe"]
 
 
 def is_pid_alive(pid: int) -> bool:
@@ -448,7 +525,7 @@ def run_optimization(mode):
                 pass
 
     if mode == "2":
-        target_kills = ["steamwebhelper.exe", "BaiduNetdiskUnite.exe", "old_media_container.exe"]
+        target_kills = load_cleanup_targets()
         killed = []
         for proc in target_kills:
             try:
@@ -458,7 +535,7 @@ def run_optimization(mode):
             except Exception:
                 pass
         if killed:
-            _bat_write(f"  [+] Closed non-essential heavy background apps: {', '.join(killed)}\n")
+            _bat_write(f"  [+] Closed configured heavy background apps: {', '.join(killed)}\n")
 
     trimmed = trim_all_process_working_sets()
     _bat_write(f"  [+] Compressed and trimmed working sets for {trimmed} background processes\n")

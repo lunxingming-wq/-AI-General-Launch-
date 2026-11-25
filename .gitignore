@@ -1,0 +1,33 @@
+# Local GGUF models & llama.cpp binaries
+models/*.gguf
+models/*.part
+*.gguf
+*.exe
+*.dll
+cudart-llama-bin-*/
+
+# Optional downloaded remote-access tools & auth token
+tools/
+.access_token
+
+# Fetcher cache & install state
+.llama_cache/
+.llama_install.json
+
+# Runtime state, logs & user chat data
+data/
+*.log
+*.db
+*.db-shm
+*.db-wal
+.models_cache.json
+.optimizer_state.json
+.mobile_sessions.json
+_active_role_state.json
+_active_tunnel_url.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+venv/
+.venv/

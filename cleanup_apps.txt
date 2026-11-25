@@ -1,0 +1,21 @@
+# ====================================================================
+# Optional Background Process Cleanup List (cleanup_apps.txt)
+# ====================================================================
+# Used ONLY when you choose Mode [2] "Aggressive Extreme Cleanup"
+# in memory_optimizer.py.
+#
+# - Put one Windows process image name (.exe) per line.
+# - Lines starting with # are comments and ignored.
+# - Uncomment or add only non-essential background apps you are okay
+#   with closing before loading a large LLM.
+# ====================================================================
+
+steamwebhelper.exe
+
+# Optional international apps (uncomment if desired):
+# EpicWebHelper.exe
+# Discord.exe
+# Spotify.exe
+
+# Optional regional / cloud drive background helpers:
+# BaiduNetdiskUnite.exe

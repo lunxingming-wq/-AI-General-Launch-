@@ -1,161 +1,157 @@
-# -AI-General-Launch-
-基于cudart-llama-bin-win-cuda-13.3-x64，所建立的通用启动，可以启动大部分语言模型，理论上cudart-llama-bin-win-cuda-13.3-x64兼容的它都兼容，同时还有一些准备的运行模式和AI提示词
-# qidong — llama.cpp Windows 智能启动中心
+<p align="right">
+  <strong>English</strong> | <a href="README_ZH.md">简体中文</a>
+</p>
 
-一个开箱即用的 **Windows 本地大模型（GGUF / llama.cpp）启动与资源调度工具**。
-双击 `qidong.bat`，按菜单选模型、选优化、选策略、选角色，即可一键拉起推理服务与 Web 界面。
+# qidong — llama.cpp Smart Windows Launcher
+
+An out-of-the-box **Windows Local LLM (`GGUF` / `llama.cpp`) Launcher & Hardware Resource Orchestrator**.
+Double-click `qidong.bat`, then walk through a 5-step interactive menu (Model → Optimization → Strategy → Role → Length) to launch the inference engine and Web UI automatically.
 
 ---
 
-## 功能一览
+## Key Features
 
-| 模块 | 功能 |
+| Module | Capabilities |
 | :--- | :--- |
-| 模型管理 | 扫描 `models/` 与 `model_dirs.txt` 中配置的任意目录（跨盘免复制），显示 `[本地]` / `[D盘]` 等来源标签；解析 GGUF 层数与架构并缓存；自动挂载同目录 `mmproj` 视觉组件 |
-| 显存/内存腾退 | 4 档优化：挂起 Wallpaper Engine、压缩后台进程工作集、CUDA 显存脉冲、可选清理高占用后台进程 |
-| 壁纸守护恢复 | 独立后台守护进程：正常退出、`Ctrl+C`、直接关闭窗口，均自动恢复壁纸 |
-| 动态策略计算 | 每次启动实时读取剩余显存/内存，自动计算 `-ngl` 层数、KV 量化与 `-c` 上下文，**不是固定值** |
-| 5 种运行策略 | 全显存加速 / 显存装模型+内存装上下文(`-nkvo`) / 均衡共享 / 自定义显存上限 / 纯内存 |
-| 对话模板自适应 | Qwen 系列使用自带 Jinja 模板；其他架构（Gemma / Llama / Mistral / DeepSeek 等）自动使用 GGUF 内置模板 |
-| 角色管理 | 命令行与网页双端：新建 / 编辑 / 删除 / 搜索 / 展开全文 / 热切换 / 原生无角色模式 / 临时角色（可转存永久） |
-| Web 中枢 | 桌面页 `/`、移动端 `/mobile`、OpenAI 兼容接口 `/v1`、SQLite 会话持久化、阅后即焚分享链接、自动显示局域网 / Tailscale 地址 |
+| **Auto Engine & CUDA Fetcher** | `llama_fetcher.py` auto-detects CPU architecture (`x64`/`arm64`), GPU vendor (NVIDIA Compute Capability & driver CUDA version via `nvidia-smi`, AMD/Intel/Qualcomm Vulkan, or CPU), downloads matching `llama-server` + `cudart-llama-bin-*` zips from `ggml-org/llama.cpp` Releases, verifies SHA-256, supports resume/retry, and handles zip-slip-safe installation |
+| **Built-in GGUF Model Downloader** | `model_fetcher.py` (`[D]` in menu) downloads `.gguf` models directly into `models/` using stdlib only — supports curated starter models, any Hugging Face repo ID (live file tree listing), multi-part split GGUFs, direct URLs, and one-key switching between **Global (`huggingface.co`)** and **Mainland China (`hf-mirror.com`)** |
+| **Cross-Drive Model Manager** | `model_manager.py` scans `models/` plus any external folders in `model_dirs.txt` (zero-copy across HDDs/SSDs/partitions, tagged `[Local]` / `[Drive X]`); automatically merges multi-part split GGUFs (`*-00001-of-0000N.gguf`) into one entry with true combined size; smartly matches `*mmproj*.gguf` vision projectors without pairing unrelated models |
+| **Real Multi-Vendor GPU & CPU Detection** | Reads real VRAM for NVIDIA (`nvidia-smi`), AMD & Intel GPUs (Windows Display Adapter 64-bit registry), and cleanly switches to safe CPU-only Pure RAM mode (`-ngl 0`) when no dedicated GPU is present |
+| **VRAM & RAM Optimization** | `memory_optimizer.py` pauses Wallpaper Engine (with an independent background guardian that restores wallpaper even on `Ctrl+C` or closing the window), trims process working sets, triggers CUDA VRAM pulse on NVIDIA GPUs, and supports user-editable `cleanup_apps.txt` for Mode `[2]` |
+| **5 Dynamic Execution Strategies** | Computes live `-ngl` GPU layers, `-nkvo` KV placement, and safe `-c` context size at every launch: Full-Speed VRAM / VRAM Model + RAM KV (`-nkvo`) / Balanced / Custom VRAM Cap / Pure RAM |
+| **Chat Template Adaptation** | Uses `_active_template.jinja` for Qwen-family models and automatically switches to built-in GGUF chat templates for other architectures (Llama / Gemma / Mistral / DeepSeek, etc.) |
+| **Dual Role Management** | Interactive CLI manager (`[M]`) and live Web UI Role Switcher modal: search, expand full prompt, create, edit, delete, hot-switch, **Native Default (No Role)**, and **Temporary Custom Role** |
+| **Web, Mobile & OpenAI API Hub** | `server_core.py` provides Desktop UI (`/`), responsive Mobile Workstation (`/mobile`), OpenAI-compatible API (`/v1`), SQLite WAL chat history, burn-after-reading share links (`/share/{token}`), and optional lightweight **Access Token** protection |
+| **Optional Regional Remote Access** | `remote_access.py` (`[R]` in menu) detects LAN / Tailscale / EasyTier / ZeroTier endpoints and optionally installs/fetches region-appropriate external remote-access tools |
 
 ---
 
-## 环境要求
+## Requirements
 
-- Windows 10 / 11
-- NVIDIA 显卡（CPU 模式也可运行），驱动需支持 CUDA 13.x
-- Python 3.9+（可选，见下方说明）
-
-> 仅用 Python 标准库即可运行启动器、显存优化与命令行角色管理；
-> 安装 `requirements.txt` 后才会启用完整的 Web 中枢（持久化会话、网页端在线角色编辑）。未安装时自动降级为 `llama-server` 原生界面。
+- Windows 10 / 11 (x64 or ARM64)
+- NVIDIA GPU, AMD/Intel GPU (Vulkan), or CPU-only PC
+- **Python 3.9+**
+  - During Python installation from [python.org](https://www.python.org/downloads/windows/), check **"Add python.exe to PATH"** — or extract a portable/embedded Python into `python\` inside this folder.
+  - Standard library alone runs `qidong.bat`, `llama_fetcher.py`, `model_fetcher.py`, `remote_access.py`, `memory_optimizer.py`, and CLI role management.
+  - Installing `requirements.txt` (`[I]` in main menu) enables the full Web Hub (`server_core.py`: persistent SQLite chats, online Web UI role editing, `/mobile`, burn-after-reading sharing, and optional Access Token auth). Without it, `qidong.bat` automatically falls back to native `llama-server` on port `8080`.
 
 ---
 
-## 安装步骤
+## Quick Start (Zero Manual File Hunting)
 
-### 1. 下载 llama.cpp 预编译包（本仓库不含二进制）
+1. **Double-click `qidong.bat`**.
+2. **Install `llama-server` & Runtime (`[F]`)**:
+   - Press `F` to auto-detect your GPU/driver and download the matching `llama.cpp` Windows package + `cudart` runtime automatically (or skip — `qidong.bat` also auto-runs `llama_fetcher.py ensure` if `llama-server.exe` is missing at launch).
+   - Manual option: extract matching `llama-bXXXX-bin-win-cuda-XX.Y-x64.zip` and `cudart-llama-bin-win-cuda-XX.Y-x64.zip` from [ggml-org/llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) alongside `qidong.bat` (keep the same CUDA version for both!).
+3. **Add or Download Models (`[D]` or `model_dirs.txt`)**:
+   - Press `D` to download a starter GGUF model (switch `[M]` between `huggingface.co` and `hf-mirror.com`), **OR**
+   - Drop `.gguf` files directly into `models/`, **OR**
+   - **Cross-Drive Zero-Copy Loading**: open `model_dirs.txt` and add absolute paths to existing model folders on any drive (e.g., `D:\AI\Models`, `E:\GGUF-Library`), one path per line.
+4. **Install Optional Web Hub Dependencies (`[I]`)**:
+   - Press `I` in the main menu to run `pip install -r requirements.txt` (lets you pick Official PyPI or China Tsinghua Mirror).
+5. **Select a model and follow the 5-step wizard** (Model → Optimization → Strategy → Role → Max Response Length).
 
-前往 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases)，下载 Windows CUDA 版：
+---
 
-| 文件 | 说明 |
+## Optional Remote Access & Regional Software Guide (`[R]`)
+
+Local PC (`http://127.0.0.1:8080`) and same-Wi-Fi LAN access (`http://<LAN-IP>:8080/mobile`) work **out of the box with zero extra software**.
+
+If you want to chat with your home PC's LLM from your phone or laptop **outside your home Wi-Fi**, qidong relies on external networking tools rather than bundling a relay server. Press **`R`** in the main menu (or run `python remote_access.py menu`) for an **optional** helper with region-tailored recommendations and auto-downloaders:
+
+| User Region | Recommended Software | Why / Features | Optional Setup via `[R]` |
+| :--- | :--- | :--- | :--- |
+| **Global / Overseas** | **Tailscale** *(Recommended)* | Private WireGuard P2P mesh VPN; install on PC + Phone and visit `http://<100.x.x.x>:8080/mobile` | `[1]` Guided setup / optional `winget install Tailscale.Tailscale` |
+| **Mainland China** | **EasyTier** *(Recommended)* | Open-source decentralized P2P mesh VPN with CN-friendly public shared nodes; no overseas account required; Windows/Android/iOS support | `[2]` Auto-downloads portable `easytier-windows-*.zip` from `EasyTier/EasyTier` Releases (supports `--mirror`) into `tools/easytier/` |
+| **Any Region (No Phone App)** | **Cloudflare Tunnel (`cloudflared`)** | Creates a temporary public HTTPS URL (`https://*.trycloudflare.com`) without installing any app on your phone | `[3]` Auto-downloads portable `cloudflared.exe` into `tools/cloudflared/`; `[6]` launches quick tunnel |
+| **Cross-Region Alternative** | **ZeroTier One** | Mature virtual LAN working across China and global networks | `[4]` Guided setup / optional `winget install ZeroTier.ZeroTierOne` |
+
+> `network_helper.py` automatically detects active **LAN**, **Tailscale**, **EasyTier**, and **ZeroTier** IPs and prints them in the startup banner.
+
+### Optional Remote Access Token (Security Protection)
+
+By default, remote access authentication is **disabled** for maximum convenience on private home Wi-Fi or personal Tailscale/EasyTier networks.
+
+If you connect over **public/shared Wi-Fi** or open a **Cloudflare Quick Tunnel**, enable the optional Access Token via `[R] -> [5]` (or `python remote_access.py token gen`, or set env var `WEB_ACCESS_TOKEN`):
+- **Localhost (`127.0.0.1`) automatically stays password-free** on your host PC (unless `WEB_AUTH_LOCAL=1` is set).
+- **Proxied / remote clients** (LAN, VPN, and Cloudflare Tunnel with `X-Forwarded-For` / `CF-Connecting-IP`) must authenticate via:
+  - Browser unlock screen or `http://<IP>:8080/?token=<YOUR_TOKEN>` (sets an `HttpOnly` session cookie automatically), **OR**
+  - Standard OpenAI API header `Authorization: Bearer <YOUR_TOKEN>` (simply paste the token as the API Key in Cherry Studio / OpenWebUI / Cursor!).
+
+---
+
+## CLI Tools Reference
+
+```powershell
+# 1. Hardware-adaptive llama.cpp engine & CUDA runtime fetcher
+python llama_fetcher.py info                  # Inspect GPU, driver CUDA, local build & recommended package
+python llama_fetcher.py install               # Download & install matching engine + cudart runtime
+python llama_fetcher.py update                # Update to the latest compatible ggml-org/llama.cpp build
+python llama_fetcher.py list                  # List available Windows variants in the latest release
+# Optional flags: --variant cuda-13.5|cuda-12.4|vulkan|cpu  --tag bXXXX  --mirror <PREFIX>  -y
+
+# 2. GGUF model downloader
+python model_fetcher.py menu                  # Interactive starter repos / custom HF repo / direct URL
+python model_fetcher.py list Qwen/Qwen2.5-3B-Instruct-GGUF --mirror cn
+python model_fetcher.py download Qwen/Qwen2.5-3B-Instruct-GGUF --mirror cn
+
+# 3. Optional remote access & access token helper
+python remote_access.py status                # Show detected VPN/tunnel tools, IPs & token status
+python remote_access.py install easytier      # Download portable EasyTier into tools/easytier/
+python remote_access.py install cloudflared   # Download portable cloudflared into tools/cloudflared/
+python remote_access.py token gen             # Generate optional .access_token
+python remote_access.py token clear           # Disable optional .access_token
+python remote_access.py tunnel                # Launch Cloudflare Quick Tunnel (prompts to enable token)
+```
+
+---
+
+## 5-Step Launcher Flow & Web Endpoints
+
+1. **Select Model**: Pick model index, `F` (Engine/CUDA), `D` (Download Models), `R` (Remote Access/Token), `I` (Install Python Deps), or `0` (Exit).
+2. **VRAM/RAM Optimization**: `[1]` Fast Deep Cleanup / `[2]` Aggressive Cleanup (reads `cleanup_apps.txt`) / `[3]` Gentle RAM Trim / `[4]` Skip.
+3. **Execution Strategy**: `[1]` Full-Speed VRAM / `[2]` VRAM Model + RAM KV (`-nkvo`) / `[3]` Balanced / `[4]` Custom VRAM Cap / `[5]` Pure RAM (CPU-only PCs automatically fall back safely to `-ngl 0`).
+4. **Role Preset**: Choose preset from `role_setting.txt`, `N` (Native Default / No Role), `E` (Temporary Custom Role), or `M` (Role Manager).
+5. **Max Output Length**: `1500` / `3000` / `7500` / `12000` / `-1` (unlimited) or any custom integer.
+
+| Endpoint | URL |
 | :--- | :--- |
-| `llama-bXXXX-bin-win-cuda-13.3-x64.zip` | 推理引擎本体（含 `llama-server.exe` 与 `ggml*.dll`） |
-| `cudart-llama-bin-win-cuda-13.3-x64.zip` | CUDA 13.3 运行时（无需单独安装 CUDA Toolkit） |
+| Desktop Web UI | `http://127.0.0.1:8080/` |
+| Mobile Workstation | `http://<LAN-OR-VPN-IP>:8080/mobile` (or `/m`) |
+| OpenAI-Compatible API | `http://127.0.0.1:8080/v1` |
+| Burn-After-Reading Share | `POST /api/links/create` → `/share/{token}` |
 
-**放置方式：**
+> Note: Sample role cards in `role_setting.txt` are preserved in their original form; you can freely edit or add roles in any language via CLI `[M]` or the Web UI Role Switcher button.
+
+---
+
+## Project Structure
 
 ```text
-your-folder/
-├── qidong.bat
-├── llama-server.exe            <- 引擎包内所有文件解压到此处（与 qidong.bat 同级）
-├── ggml*.dll / llama*.dll ...
-└── cudart-llama-bin-win-cuda-13.3-x64/   <- cudart 包解压成此文件夹
-    ├── cudart64_13.dll
-    ├── cublas64_13.dll
-    └── cublasLt64_13.dll
+├── qidong.bat               # Main Windows launcher (ASCII/UTF-8, chcp 65001)
+├── llama_fetcher.py         # Auto hardware detector & llama.cpp + CUDA runtime downloader
+├── model_fetcher.py         # Optional GGUF downloader (Hugging Face / hf-mirror / direct URL)
+├── remote_access.py         # Optional regional remote-access installer & Access Token helper
+├── model_manager.py         # Multi-drive GGUF scanner, split-GGUF merger, mmproj matcher & VRAM/RAM planner
+├── memory_optimizer.py      # VRAM/RAM release & Wallpaper Engine guardian
+├── role_manager.py          # CLI & Web UI role preset manager + Jinja template sync
+├── server_core.py           # FastAPI Web & API Hub, optional auth middleware, /mobile UI & reverse proxy
+├── db_manager.py            # SQLite WAL conversation store & burn-after-reading share links
+├── network_helper.py        # LAN / Tailscale / EasyTier / ZeroTier IP detector
+├── thinking_parser.py       # <think> reasoning tag parser
+├── model_dirs.txt           # Cross-drive external model directory list
+├── cleanup_apps.txt         # Editable background process list for Optimization Mode [2]
+├── role_setting.txt         # Role preset cards
+├── _active_template.jinja   # Custom Qwen chat template
+├── requirements.txt         # Optional Python dependencies for Web Hub
+├── README.md / README_ZH.md # Bilingual documentation
+├── models/                  # Local .gguf model folder
+└── web/                     # Static Web UI assets
 ```
-
-`qidong.bat` 启动时会自动把该 `cudart` 文件夹加入 `PATH`；若你已自行配置好 CUDA 环境，可不放。
-
-**作者实测环境（供参考）：**
-
-| 组件 | 版本 |
-| :--- | :--- |
-| `llama-server.exe` | `0.7.0-dev (build 11935, commit 7ecb57f7a)`，Clang 20.1.8 x86_64 |
-| `cudart64_13.dll` | 6.14.11.13030 |
-| `cublas64_13.dll` / `cublasLt64_13.dll` | 6.14.11.1351 |
-
-引擎包与 cudart 包请保持同为 `cuda-13.3` 版本，不要混用不同 CUDA 大版本。
-使用其他 CUDA 版本（如 12.x）的包时，同步替换 `cudart` 文件夹名并修改 `qidong.bat` 中对应路径即可。
-
-### 2. 安装 Python 依赖（可选）
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. 放入模型
-
-- 把 `.gguf` 文件放进 `models/`；
-- 或编辑 `model_dirs.txt`，每行写一个模型目录的绝对路径（`#` 开头为注释）。
 
 ---
-
-## 使用方法
-
-双击 `qidong.bat`，依次完成 5 步选择：
-
-1. **选模型**：输入序号，直接回车默认 `[1]`；`0` 退出。
-2. **选优化模式**
-   - `[1]` 极速深度腾退（推荐）：挂起壁纸 + 清工作集 + CUDA 显存脉冲
-   - `[2]` 极限深挖：在 1 基础上关闭非核心高占用进程
-   - `[3]` 温和：只清内存
-   - `[4]` 不优化
-   - `0` 返回上一步
-3. **选运行策略**：确认后会显示计算出的层数、上下文、显存占用，回车确认。
-   - 小模型追求速度 → 全显存加速
-   - 大模型 / 要长上下文 → 显存装模型 + 内存装上下文
-   - 要同时运行游戏或绘图软件 → 均衡共享 / 自定义显存上限
-4. **选角色**
-   - 输入编号：使用该预设角色
-   - `N`：原生默认（不注入任何角色设定，适合写代码 / 翻译 / 英文）
-   - `E`：临时自定义（粘贴提示词，**空行回车结束，输入 `0` 取消**，可顺便存为永久角色）
-   - `M`：管理中心（`A` 新增 / `E` 编辑 / `V` 查看全文 / `D` 删除 / `O` 记事本打开）
-   - 直接回车：沿用当前激活的角色
-5. **选单次回复长度**：1500 / 3000 / 7500 / 12000 Tokens 或不限制，也可直接输入数字。
-
-启动完成后访问：
-
-| 入口 | 地址 |
-| :--- | :--- |
-| 桌面网页 | `http://127.0.0.1:8080/` |
-| 手机 / 平板 | `http://<局域网IP>:8080/mobile`（控制台会打印实际地址） |
-| OpenAI 兼容接口 | `http://127.0.0.1:8080/v1` |
-
-模型结束后菜单会提供：`[1]` 重启当前配置 / `[2]` 重选角色 / `[3]` 重选策略 / `[0]` 返回模型列表。
-
-### 网页端角色管理
-
-点击页面右上角的角色按钮：可搜索、展开全文、新建、编辑、删除、切换角色，或切到「原生默认模式」。
-保存后在下一条消息立即生效，并写回 `role_setting.txt`。
-
-### 角色文件格式
-
-`role_setting.txt` 中每个角色以独占一行的 `[角色名]` 开头，下方为提示词（支持多行）。
-正文里如需写方括号，请在行首保留空格缩进，避免被识别为新角色标题。
-
----
-
-## 目录结构
-
-```text
-├── qidong.bat               # 主启动脚本（GBK 编码，请勿用 UTF-8 保存）
-├── model_manager.py         # 多目录扫描 / 架构识别 / 显存内存策略计算
-├── memory_optimizer.py      # 显存内存腾退 / 壁纸守护恢复
-├── role_manager.py          # 角色管理 / 模板同步 / 网页浮窗注入
-├── server_core.py           # Web 与 API 中枢 / 角色接口 / 移动端页面 / 反向代理
-├── db_manager.py            # SQLite 会话与分享链接
-├── network_helper.py        # 局域网 / Tailscale 地址检测
-├── thinking_parser.py       # <think> 思考链解析
-├── model_dirs.txt           # 外部模型目录配置
-├── role_setting.txt         # 角色提示词
-├── _active_template.jinja   # Qwen 系列对话模板
-├── requirements.txt
-├── models/                  # 模型目录
-└── web/                     # Web UI 静态资源
-```
-
-## 常见问题
-
-- **提示未找到 llama-server.exe**：引擎包没解压到与 `qidong.bat` 同级目录。
-- **启动报缺少 `cudart64_13.dll` / `cublas64_13.dll`**：未放置 cudart 文件夹，或引擎与 cudart 的 CUDA 大版本不一致。
-- **中文乱码**：`qidong.bat` 必须保持 GBK 编码。
-- **网页无法保存角色**：未安装 `requirements.txt` 依赖，`server_core.py` 没有启动。
-- **手机打不开**：确认与电脑在同一局域网，并放行 Windows 防火墙的 8080 端口。
 
 ## License
 
-MIT License，详见 [LICENSE](LICENSE)。
-`web/_app/` 下的静态界面来源于 llama.cpp（MIT）。
+MIT License — see [LICENSE](LICENSE).
+Static Web UI assets under `web/_app/` originate from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT).

@@ -7,9 +7,40 @@ import re
 TARGET_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def get_network_ips():
-    # Prefer authoritative Tailscale IP (PATH or default install location)
+def _parse_ipconfig():
+    ips = []
+    for enc in ("utf-8", "gbk", "cp1252"):
+        try:
+            out = subprocess.check_output(
+                ["ipconfig"],
+                text=True,
+                encoding=enc,
+                errors="ignore",
+                creationflags=0x08000000 if sys.platform == "win32" else 0,
+            )
+            current_adapter = ""
+            for line in out.splitlines():
+                if line and not line.startswith(" ") and ":" in line:
+                    current_adapter = line.split(":")[0].strip()
+                if "IPv4" in line or "IP Address" in line:
+                    m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+                    if m:
+                        ip = m.group(1)
+                        if not ip.startswith(("127.", "169.254.")):
+                            ips.append((current_adapter, ip))
+            if ips:
+                break
+        except Exception:
+            continue
+    return ips
+
+
+def get_all_network_endpoints():
+    """Return dict with LAN, Tailscale, EasyTier, and ZeroTier IPv4 addresses."""
     tailscale_ip = None
+    easytier_ip = None
+    zerotier_ip = None
+
     ts_bins = ["tailscale"]
     default_ts_path = r"C:\Program Files\Tailscale\tailscale.exe"
     if os.path.exists(default_ts_path):
@@ -22,49 +53,54 @@ def get_network_ips():
                 text=True,
                 encoding="utf-8",
                 errors="ignore",
+                timeout=2,
                 creationflags=0x08000000 if sys.platform == "win32" else 0,
             ).strip()
             if ts_out and ts_out.startswith("100."):
-                tailscale_ip = ts_out
+                tailscale_ip = ts_out.splitlines()[0].strip()
                 break
         except Exception:
             continue
 
-    ips = []
-    try:
-        out = subprocess.check_output(["ipconfig"], text=True, encoding="utf-8", errors="ignore")
-        current_adapter = ""
-        for line in out.splitlines():
-            if line and not line.startswith(" ") and ":" in line:
-                current_adapter = line.split(":")[0].strip()
-            if "IPv4" in line or "IP Address" in line:
-                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
-                if m:
-                    ip = m.group(1)
-                    # Exclude loopback (127.x) and APIPA link-local (169.254.x)
-                    if not ip.startswith(("127.", "169.254.")):
-                        ips.append((current_adapter, ip))
-    except Exception:
-        pass
-
+    ips = _parse_ipconfig()
     lan_ip = None
+    vpn_keywords = ("tailscale", "easytier", "zerotier", "mihomo", "clash", "wintun", "wireguard", "vethernet")
+
     for adapter, ip in ips:
-        if "tailscale" in adapter.lower():
+        low = adapter.lower()
+        if "tailscale" in low:
             if not tailscale_ip and ip.startswith("100."):
                 tailscale_ip = ip
-        elif "mihomo" not in adapter.lower() and "clash" not in adapter.lower():
-            if ip.startswith(("192.168.", "10.", "172.")):
+        elif "easytier" in low or low.startswith("et"):
+            if not easytier_ip:
+                easytier_ip = ip
+        elif "zerotier" in low:
+            if not zerotier_ip:
+                zerotier_ip = ip
+        elif not any(k in low for k in vpn_keywords):
+            if ip.startswith(("192.168.", "10.", "172.")) and not lan_ip:
                 lan_ip = ip
 
     if not lan_ip and ips:
         for adapter, ip in ips:
-            if "mihomo" not in adapter.lower() and "clash" not in adapter.lower() and "tailscale" not in adapter.lower():
+            low = adapter.lower()
+            if not any(k in low for k in ("mihomo", "clash", "tailscale", "easytier", "zerotier")):
                 lan_ip = ip
                 break
         if not lan_ip:
             lan_ip = ips[0][1]
 
-    return lan_ip or "127.0.0.1", tailscale_ip
+    return {
+        "lan": lan_ip or "127.0.0.1",
+        "tailscale": tailscale_ip,
+        "easytier": easytier_ip,
+        "zerotier": zerotier_ip,
+    }
+
+
+def get_network_ips():
+    ep = get_all_network_endpoints()
+    return ep["lan"], ep["tailscale"]
 
 
 def _detect_console_encoding() -> str:
@@ -107,17 +143,21 @@ def _bat_write(text: str) -> None:
 
 
 def print_endpoints():
-    lan_ip, tailscale_ip = get_network_ips()
+    ep = get_all_network_endpoints()
 
     lines = [
         "------------------------------------------------------------",
         "[Service Endpoints (Web UI & API Hub)]",
         " * Local PC Access       : http://127.0.0.1:8080",
-        f" * LAN (Phone / Tablet)  : http://{lan_ip}:8080",
+        f" * LAN (Phone / Tablet)  : http://{ep['lan']}:8080",
         "   (Mobile-ready chat synced with local SQLite history)",
     ]
-    if tailscale_ip:
-        lines.append(f" * Tailscale Remote      : http://{tailscale_ip}:8080")
+    if ep["tailscale"]:
+        lines.append(f" * Tailscale Remote      : http://{ep['tailscale']}:8080")
+    if ep["easytier"]:
+        lines.append(f" * EasyTier Remote       : http://{ep['easytier']}:8080")
+    if ep["zerotier"]:
+        lines.append(f" * ZeroTier Remote       : http://{ep['zerotier']}:8080")
     lines.append(" * OpenAI-Compatible API : http://127.0.0.1:8080/v1")
     lines.append("------------------------------------------------------------")
 
